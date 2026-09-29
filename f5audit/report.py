@@ -8,7 +8,6 @@ the change control; this tool never executes anything.
 from __future__ import annotations
 
 import csv
-import ipaddress
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -18,9 +17,10 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from . import commands
 from .analyzer import AnalysisResult, ObjectVerdict, Verdict
 from .correlator import Correlation
-from .models import Node, PoolMember
+from .models import Node, Pool, PoolMember
 from .parsing import ParsedData
 
 VERDICT_FILLS = {
@@ -48,6 +48,46 @@ CHANGE_HEADERS = [
     "Create node (rollback)",
     "Add node back to pool (rollback)",
 ]
+
+# Only these verdicts get change and rollback commands; every other one
+# (MANUAL REVIEW, INACTIVE, UNRELIABLE) stays blank, the conservative choice.
+COMMAND_VERDICTS = (Verdict.ORPHAN, Verdict.OFFLINE_CANDIDATE)
+
+NODE_COMMAND_HEADERS = [
+    "Remove node from pool(s)",
+    "Delete node",
+    "Create node (rollback)",
+    "Add node back to pool(s) (rollback)",
+]
+POOL_COMMAND_HEADERS = [
+    "Detach pool from virtual servers",
+    "Delete pool",
+    "Recreate pool (rollback)",
+    "Reattach pool to virtual servers (rollback)",
+]
+VIRTUAL_COMMAND_HEADERS = [
+    "Delete virtual server",
+    "Recreate virtual server (rollback)",
+]
+CHAIN_COMMAND_HEADERS = [
+    "Delete virtual servers",
+    "Delete pool",
+    "Delete nodes",
+    "Recreate nodes (rollback)",
+    "Recreate pool (rollback)",
+    "Recreate virtual servers (rollback)",
+]
+
+VIRTUAL_ADDRESS_NOTE = (
+    "Deleting the last virtual server on an address also deletes its "
+    "virtual-address (auto-delete); re-creating the virtual server brings "
+    "it back with default settings, so record any non-default ARP, ICMP, "
+    "route-advertisement or traffic-group setting before the change."
+)
+PROFILES_MISSING_NOTE = (
+    "No rollback: the virtual server's profiles were not collected; re-run "
+    "'f5audit collect --save-raw' on this raw directory to backfill them."
+)
 
 
 @dataclass
@@ -93,28 +133,6 @@ def _network_cells(parsed: ParsedData, node) -> list[object]:
     return [info.arp_mac, note]
 
 
-def _member_ref(node_path: str, port: str) -> str:
-    # F5 quirk: a node named by its IPv6 literal separates the port with '.'.
-    node_name = node_path.rsplit("/", 1)[-1]
-    separator = "." if node_name.count(":") > 1 else ":"
-    return f"{node_path}{separator}{port}"
-
-
-def _node_create_command(node: Node) -> str:
-    ip_part = node.address.partition("%")[0]
-    try:
-        ipaddress.ip_address(ip_part)
-        target = f"address {node.address}"
-    except ValueError:
-        target = f"fqdn {{ name {node.address} }}"
-    command = f"create ltm node {node.full_path} {target}"
-    # The node-level monitor lives on the node object and is lost with it;
-    # the pool monitor survives on the pool and needs no rollback.
-    if node.monitor and node.monitor != "default":
-        command += f" monitor {node.monitor}"
-    return command
-
-
 def _change_cells(
     node: Node | None,
     node_verdict: ObjectVerdict | None,
@@ -129,19 +147,80 @@ def _change_cells(
     blank = ["", "", "", ""]
     if node is None or node_verdict is None:
         return blank
-    if node_verdict.verdict not in (Verdict.OFFLINE_CANDIDATE, Verdict.ORPHAN):
+    if not _has_commands(node_verdict):
         return blank
-    delete = f"delete ltm node {node.full_path}"
-    create = _node_create_command(node)
+    delete = commands.delete_node_command(node.full_path)
+    create = commands.node_create_command(node)
     if node_verdict.verdict == Verdict.ORPHAN or member is None or not pool_path:
         return ["", delete, create, ""]
-    reference = _member_ref(node.full_path, member.port)
-    remove = f"modify ltm pool {pool_path} members delete {{ {reference} }}"
-    add_member = reference
-    if member.priority_group:
-        add_member += f" {{ priority-group {member.priority_group} }}"
-    add = f"modify ltm pool {pool_path} members add {{ {add_member} }}"
+    remove = commands.remove_member_command(pool_path, member)
+    add = commands.add_member_command(pool_path, member)
     return [remove, delete, create, add]
+
+
+def _has_commands(verdict: ObjectVerdict | None) -> bool:
+    return verdict is not None and verdict.verdict in COMMAND_VERDICTS
+
+
+def _memberships(parsed: ParsedData, node_path: str) -> list[tuple[str, PoolMember]]:
+    return [
+        (pool_path, member)
+        for pool_path, pool in sorted(parsed.pools.items())
+        for member in pool.members
+        if member.node_full_path == node_path
+    ]
+
+
+def _node_command_cells(parsed: ParsedData, node: Node, verdict: ObjectVerdict) -> list[str]:
+    """NODE_COMMAND_HEADERS cells: one remove/add line per pool membership."""
+    if not _has_commands(verdict):
+        return ["", "", "", ""]
+    memberships = _memberships(parsed, node.full_path)
+    return [
+        "\n".join(
+            commands.remove_member_command(pool_path, member) for pool_path, member in memberships
+        ),
+        commands.delete_node_command(node.full_path),
+        commands.node_create_command(node),
+        "\n".join(
+            commands.add_member_command(pool_path, member) for pool_path, member in memberships
+        ),
+    ]
+
+
+def _pool_blockers(correlation: Correlation, pool_path: str) -> str:
+    """Why tmsh would refuse to delete the pool, or empty when nothing we
+    cannot detach from here references it."""
+    reasons = []
+    irules = correlation.pool_to_irules.get(pool_path)
+    if irules:
+        reasons.append(f"iRule(s) {_join(irules)}")
+    policies = correlation.pool_to_policies.get(pool_path)
+    if policies:
+        reasons.append(f"policy(ies) {_join(policies)}")
+    if not reasons:
+        return ""
+    return (
+        f"Commands withheld: referenced by {' and '.join(reasons)}; tmsh refuses "
+        "the delete until those references are edited."
+    )
+
+
+def _with_note(notes: str, extra: str) -> str:
+    return f"{notes} {extra}".strip() if extra else notes
+
+
+def _virtual_command_cells(virtual, verdict: ObjectVerdict) -> tuple[list[str], str]:
+    """(VIRTUAL_COMMAND_HEADERS cells, extra note)."""
+    if not _has_commands(verdict):
+        return ["", ""], ""
+    note = VIRTUAL_ADDRESS_NOTE
+    if not virtual.profiles_collected:
+        note += " " + PROFILES_MISSING_NOTE
+    return [
+        commands.delete_virtual_command(virtual.full_path),
+        commands.virtual_create_command(virtual),
+    ], note
 
 
 def build_tables(
@@ -344,7 +423,7 @@ def _build_orphan_nodes(parsed: ParsedData, analysis: AnalysisResult) -> ReportT
         "Monitor",
         "Verdict",
         "Notes",
-        "Suggested command (informational)",
+        *NODE_COMMAND_HEADERS,
         "ARP MAC",
         "Network note",
     ]
@@ -361,7 +440,7 @@ def _build_orphan_nodes(parsed: ParsedData, analysis: AnalysisResult) -> ReportT
                 node.monitor,
                 verdict.verdict,
                 verdict.notes,
-                f"delete ltm node {path}" if verdict.verdict == Verdict.ORPHAN else "",
+                *_node_command_cells(parsed, node, verdict),
             ]
             + _network_cells(parsed, node)
         )
@@ -382,13 +461,14 @@ def _build_pools(
         "Policies forwarding to pool",
         "Verdict",
         "Notes",
-        "Suggested command (informational)",
+        *POOL_COMMAND_HEADERS,
     ]
     table = ReportTable("Orphan-Inactive Pools", headers, verdict_columns=(8,))
     for path, verdict in sorted(analysis.pool_verdicts.items()):
         if verdict.verdict == Verdict.IN_USE:
             continue
         pool = parsed.pools[path]
+        cells, note = _pool_command_cells(correlation, pool, verdict)
         table.rows.append(
             [
                 path,
@@ -400,11 +480,31 @@ def _build_pools(
                 _join(correlation.pool_to_irules.get(path, set())),
                 _join(correlation.pool_to_policies.get(path, set())),
                 verdict.verdict,
-                verdict.notes,
-                f"delete ltm pool {path}" if verdict.verdict == Verdict.ORPHAN else "",
+                _with_note(verdict.notes, note),
+                *cells,
             ]
         )
     return table
+
+
+def _pool_command_cells(
+    correlation: Correlation, pool: Pool, verdict: ObjectVerdict
+) -> tuple[list[str], str]:
+    """(POOL_COMMAND_HEADERS cells, extra note). Detach covers only default
+    pools; an iRule or policy reference withholds every command."""
+    blank = ["", "", "", ""]
+    if not _has_commands(verdict):
+        return blank, ""
+    blockers = _pool_blockers(correlation, pool.full_path)
+    if blockers:
+        return blank, blockers
+    virtuals = sorted(correlation.pool_to_virtuals.get(pool.full_path, set()))
+    return [
+        "\n".join(commands.detach_pool_command(vs) for vs in virtuals),
+        commands.delete_pool_command(pool.full_path),
+        commands.pool_create_command(pool),
+        "\n".join(commands.reattach_pool_command(vs, pool.full_path) for vs in virtuals),
+    ], ""
 
 
 def _build_inactive_virtuals(parsed: ParsedData, analysis: AnalysisResult) -> ReportTable:
@@ -420,12 +520,14 @@ def _build_inactive_virtuals(parsed: ParsedData, analysis: AnalysisResult) -> Re
         "Bits out",
         "Verdict",
         "Notes",
+        *VIRTUAL_COMMAND_HEADERS,
     ]
     table = ReportTable("Inactive Virtual Servers", headers, verdict_columns=(9,))
     for path, verdict in sorted(analysis.virtual_verdicts.items()):
         if verdict.verdict == Verdict.IN_USE:
             continue
         virtual = parsed.virtuals[path]
+        cells, note = _virtual_command_cells(virtual, verdict)
         table.rows.append(
             [
                 path,
@@ -438,7 +540,8 @@ def _build_inactive_virtuals(parsed: ParsedData, analysis: AnalysisResult) -> Re
                 virtual.bits_in,
                 virtual.bits_out,
                 verdict.verdict,
-                verdict.notes,
+                _with_note(verdict.notes, note),
+                *cells,
             ]
         )
     return table
@@ -448,10 +551,11 @@ def _build_dead_chains(
     parsed: ParsedData, correlation: Correlation, analysis: AnalysisResult
 ) -> ReportTable:
     """One row per dead chain, grouped by pool: the artifact to take to the
-    config owner. Commands are informational text, ordered VS -> pool ->
-    nodes; only objects with an OFFLINE verdict get a delete line, so a
-    pool capped at MANUAL REVIEW by dynamic iRules, or a node alive in
-    another pool, is listed without one."""
+    config owner. Commands are informational text, one column per step:
+    VS -> pool -> nodes, then the rollback in reverse. Only OFFLINE objects
+    get commands, and only when tmsh would accept them in this order: a
+    pool is deleted only if nothing outside this row still references it,
+    and a node only if this pool is deleted here and was its last pool."""
     headers = [
         "Pool",
         "Partition",
@@ -464,7 +568,7 @@ def _build_dead_chains(
         "VS verdicts",
         "Verdict",
         "Notes",
-        "Suggested commands (informational)",
+        *CHAIN_COMMAND_HEADERS,
     ]
     table = ReportTable("Dead Chains", headers, verdict_columns=(9,))
     for path in sorted(analysis.offline_pools):
@@ -472,27 +576,52 @@ def _build_dead_chains(
         pool = parsed.pools[path]
         vs_paths = sorted(vs for vs, pools in correlation.virtual_to_pools.items() if path in pools)
         node_paths = sorted({member.node_full_path for member in pool.members})
-        commands = []
-        vs_states, vs_verdict_labels = [], []
+        notes = []
+
+        vs_states, vs_verdict_labels, deleted_virtuals = [], [], []
         for vs_path in vs_paths:
             virtual = parsed.virtuals.get(vs_path)
             vs_states.append(
                 f"{virtual.admin_state}/{virtual.availability or '?'}" if virtual else "?"
             )
             vs_verdict = analysis.virtual_verdicts.get(vs_path)
-            label = vs_verdict.verdict if vs_verdict else ""
-            vs_verdict_labels.append(label)
-            if label == Verdict.OFFLINE_CANDIDATE:
-                commands.append(f"delete ltm virtual {vs_path}")
-        if verdict.verdict == Verdict.OFFLINE_CANDIDATE:
-            commands.append(f"delete ltm pool {path}")
-        node_verdict_labels = []
+            vs_verdict_labels.append(vs_verdict.verdict if vs_verdict else "")
+            if virtual and _has_commands(vs_verdict):
+                deleted_virtuals.append(virtual)
+        if deleted_virtuals:
+            notes.append(VIRTUAL_ADDRESS_NOTE)
+            if any(not virtual.profiles_collected for virtual in deleted_virtuals):
+                notes.append(PROFILES_MISSING_NOTE)
+
+        pool_deleted = False
+        if _has_commands(verdict):
+            deleted_paths = {virtual.full_path for virtual in deleted_virtuals}
+            kept = sorted(correlation.pool_to_virtuals.get(path, set()) - deleted_paths)
+            blockers = _pool_blockers(correlation, path)
+            if blockers:
+                notes.append(blockers)
+            elif kept:
+                notes.append(
+                    f"Pool not deleted: still the default pool of {', '.join(kept)}, "
+                    "which is not a removal candidate (see Orphan-Inactive Pools)."
+                )
+            else:
+                pool_deleted = True
+
+        node_verdict_labels, deleted_nodes = [], []
         for node_path in node_paths:
             node_verdict = analysis.node_verdicts.get(node_path)
-            label = node_verdict.verdict if node_verdict else ""
-            node_verdict_labels.append(label)
-            if label == Verdict.OFFLINE_CANDIDATE:
-                commands.append(f"delete ltm node {node_path}")
+            node_verdict_labels.append(node_verdict.verdict if node_verdict else "")
+            node = parsed.nodes.get(node_path)
+            if node is None or not _has_commands(node_verdict):
+                continue
+            if pool_deleted and correlation.node_to_pools.get(node_path, set()) <= {path}:
+                deleted_nodes.append(node)
+            else:
+                notes.append(
+                    f"Node {node_path}: remove it from its pools first (see Orphan Nodes)."
+                )
+
         table.rows.append(
             [
                 path,
@@ -505,8 +634,20 @@ def _build_dead_chains(
                 ", ".join(vs_states),
                 ", ".join(vs_verdict_labels),
                 verdict.verdict,
-                verdict.notes,
-                "\n".join(commands),
+                " ".join([verdict.notes, *notes]).strip(),
+                "\n".join(
+                    commands.delete_virtual_command(virtual.full_path)
+                    for virtual in deleted_virtuals
+                ),
+                commands.delete_pool_command(path) if pool_deleted else "",
+                "\n".join(commands.delete_node_command(node.full_path) for node in deleted_nodes),
+                "\n".join(commands.node_create_command(node) for node in deleted_nodes),
+                commands.pool_create_command(pool) if pool_deleted else "",
+                "\n".join(
+                    command
+                    for command in map(commands.virtual_create_command, deleted_virtuals)
+                    if command
+                ),
             ]
         )
     return table

@@ -42,6 +42,8 @@ class PoolMember:
     cur_conns: int | None = None
     total_conns: int | None = None
     priority_group: int = 0
+    ratio: int = 1
+    connection_limit: int = 0
     app_service: str = ""
 
 
@@ -51,11 +53,25 @@ class Pool:
     partition: str
     name: str
     monitors: list[str] = field(default_factory=list)  # normalized full paths
+    monitor_expression: str = ""  # raw, keeps 'and' / 'min N of { ... }'
     lb_method: str = ""
+    min_active_members: int = 0
+    slow_ramp_time: int = 10
+    service_down_action: str = "none"
+    description: str = ""
     members: list[PoolMember] = field(default_factory=list)
+    # False when the members subcollection was denied or never fetched:
+    # an empty `members` list then means unknown, not empty.
+    members_collected: bool = False
     availability: str = ""
     total_conns: int | None = None
     app_service: str = ""
+
+
+@dataclass
+class VirtualProfile:
+    full_path: str
+    context: str = "all"  # all / clientside / serverside
 
 
 @dataclass
@@ -64,11 +80,27 @@ class VirtualServer:
     partition: str
     name: str
     destination: str = ""  # ip:port
+    destination_path: str = ""  # as configured, '/Partition/ip:port'
     default_pool: str = ""  # normalized full path, empty if none
     irules: list[str] = field(default_factory=list)
     policies: list[str] = field(default_factory=list)
-    profiles: list[str] = field(default_factory=list)
+    profiles: list[VirtualProfile] = field(default_factory=list)
+    # False when the profiles subcollection was denied or never fetched
+    # (raw caches older than profile collection): no rollback is offered.
+    profiles_collected: bool = False
     persistence: list[str] = field(default_factory=list)
+    fallback_persistence: str = ""
+    ip_protocol: str = ""
+    mask: str = ""
+    source: str = ""
+    snat_type: str = ""  # automap / snat / lsn / none
+    snat_pool: str = ""
+    vlans: list[str] = field(default_factory=list)
+    vlans_enabled: bool = False
+    translate_address: str = ""
+    translate_port: str = ""
+    connection_limit: int = 0
+    description: str = ""
     admin_state: str = ""  # enabled / disabled
     availability: str = ""
     total_conns: int | None = None

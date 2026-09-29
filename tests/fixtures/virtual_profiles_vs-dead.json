@@ -1,0 +1,23 @@
+[
+  {
+    "kind": "tm:ltm:virtual:profiles:profilesstate",
+    "name": "tcp",
+    "partition": "Common",
+    "fullPath": "/Common/tcp",
+    "context": "all"
+  },
+  {
+    "kind": "tm:ltm:virtual:profiles:profilesstate",
+    "name": "http",
+    "partition": "Common",
+    "fullPath": "/Common/http",
+    "context": "all"
+  },
+  {
+    "kind": "tm:ltm:virtual:profiles:profilesstate",
+    "name": "clientssl-example",
+    "partition": "Common",
+    "fullPath": "/Common/clientssl-example",
+    "context": "clientside"
+  }
+]

@@ -389,3 +389,47 @@ def test_parse_collection_reads_app_service():
     assert member.app_service == "/Common/x.app/x"
     assert parsed.pools["/Common/pool-web"].app_service == ""
     assert parsed.nodes["/Common/node-dead"].app_service == ""
+
+
+def test_virtual_rollback_fields_and_profiles_are_parsed():
+    parsed = parse_collection(build_collection())
+    virtual = parsed.virtuals["/Common/vs-dead"]
+    assert virtual.destination == "192.0.2.13:443"
+    assert virtual.destination_path == "/Common/192.0.2.13:443"
+    assert virtual.mask == "255.255.255.255"
+    assert virtual.ip_protocol == "tcp"
+    assert virtual.snat_type == "snat"
+    assert virtual.snat_pool == "/Common/snat-example"
+    assert virtual.vlans == ["/Common/vlan-external"]
+    assert virtual.vlans_enabled
+    assert virtual.fallback_persistence == "/Common/source_addr"
+    assert virtual.profiles_collected
+    assert [(p.full_path, p.context) for p in virtual.profiles] == [
+        ("/Common/tcp", "all"),
+        ("/Common/http", "all"),
+        ("/Common/clientssl-example", "clientside"),
+    ]
+    # No profiles dataset (older raw cache): unknown, not "no profiles".
+    assert not parsed.virtuals["/Common/vs-web"].profiles_collected
+
+
+def test_pool_rollback_fields_are_parsed():
+    collection = build_collection()
+    collection.datasets["ltm_pool@Common"][0].update(
+        {
+            "monitor": "min 1 of { /Common/http /Common/tcp } ",
+            "minActiveMembers": 1,
+            "slowRampTime": 30,
+            "description": "web tier",
+        }
+    )
+    collection.datasets["ltm_pool_members@/Common/pool-web"][0].update(
+        {"ratio": 3, "connectionLimit": 100}
+    )
+    pool = parse_collection(collection).pools["/Common/pool-web"]
+    assert pool.monitor_expression == "min 1 of { /Common/http /Common/tcp }"
+    assert pool.min_active_members == 1
+    assert pool.slow_ramp_time == 30
+    assert pool.description == "web tier"
+    assert pool.members[0].ratio == 3
+    assert pool.members[0].connection_limit == 100

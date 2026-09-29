@@ -232,3 +232,29 @@ def test_resumed_collection_retries_previous_failures(tmp_path):
     assert "/mgmt/tm/ltm/rule" in client.requested
     assert data.get("ltm_rule@Common") == []
     assert data.meta["denied"] == []
+
+
+def test_collect_fetches_virtual_policies_and_profiles_per_virtual():
+    responses = minimal_responses()
+    responses["/mgmt/tm/ltm/virtual"] = [load_fixture("virtuals.json")[2]]  # vs-dead
+    responses["/mgmt/tm/ltm/virtual/~Common~vs-dead/policies"] = []
+    responses["/mgmt/tm/ltm/virtual/~Common~vs-dead/profiles"] = load_fixture(
+        "virtual_profiles_vs-dead.json"
+    )
+    client = FakeClient(responses)
+    data = Collector(client).collect()
+
+    assert data.get("ltm_virtual_policies@/Common/vs-dead") == []
+    assert len(data.get("ltm_virtual_profiles@/Common/vs-dead")) == 3
+    # Per-object subcollections only: never expandSubcollections over a list.
+    assert "/mgmt/tm/ltm/virtual/~Common~vs-dead/profiles" in client.requested
+
+
+def test_collect_tolerates_missing_virtual_profiles():
+    responses = minimal_responses()
+    responses["/mgmt/tm/ltm/virtual"] = [load_fixture("virtuals.json")[2]]
+    data = Collector(FakeClient(responses)).collect()
+
+    assert data.meta["aborted"] is None
+    assert "ltm_virtual_profiles@/Common/vs-dead" not in data.datasets
+    assert not any("profiles" in endpoint for endpoint in data.meta["missing_endpoints"])

@@ -1,6 +1,6 @@
 """Verdict rule tests: every rule with positive and negative cases."""
 
-from f5audit.analyzer import Analyzer, Verdict
+from f5audit.analyzer import POINT_IN_TIME_NOTE, Analyzer, Verdict
 from f5audit.correlator import correlate
 from f5audit.models import IRule, Pool, PoolMember, VirtualServer
 from f5audit.parsing import parse_collection
@@ -445,3 +445,95 @@ def test_iapp_in_use_objects_stay_in_use():
     result = analyze(mutate=own)
     assert result.pool_verdicts["/Common/pool-web"].verdict == Verdict.IN_USE
     assert result.node_verdicts["/Common/node-web-1"].verdict == Verdict.IN_USE
+
+
+# ---------------------------------------------------------------------------
+# Empty pools
+# ---------------------------------------------------------------------------
+
+
+def empty_pool(path):
+    def mutate(parsed):
+        parsed.pools[path].members = []
+
+    return mutate
+
+
+def test_parsed_pool_records_whether_members_were_collected():
+    parsed = parse_collection(build_collection())
+    assert parsed.pools["/Common/pool-web"].members_collected
+    collection = build_collection()
+    del collection.datasets["ltm_pool_members@/Common/pool-idle"]
+    parsed = parse_collection(collection)
+    assert not parsed.pools["/Common/pool-idle"].members_collected
+
+
+def test_empty_referenced_pool_is_offline():
+    result = analyze(mutate=empty_pool("/Common/pool-idle"))
+    verdict = result.pool_verdicts["/Common/pool-idle"]
+    assert verdict.verdict == Verdict.OFFLINE_CANDIDATE
+    assert "no members" in verdict.notes
+    assert POINT_IN_TIME_NOTE not in verdict.notes
+    assert "/Common/pool-idle" in result.offline_pools
+
+
+def test_pool_with_uncollected_members_is_not_offline():
+    def mutate(parsed):
+        pool = parsed.pools["/Common/pool-idle"]
+        pool.members = []
+        pool.members_collected = False
+
+    result = analyze(mutate=mutate)
+    assert result.pool_verdicts["/Common/pool-idle"].verdict != Verdict.OFFLINE_CANDIDATE
+    assert "/Common/pool-idle" not in result.offline_pools
+
+
+def test_empty_unreferenced_pool_stays_orphan():
+    result = analyze(mutate=empty_pool("/Common/pool-orphan"))
+    assert result.pool_verdicts["/Common/pool-orphan"].verdict == Verdict.ORPHAN
+
+
+def test_empty_pool_reachable_by_dynamic_irule_is_manual_review():
+    def mutate(parsed):
+        empty_pool("/Common/pool-idle")(parsed)
+        parsed.irules["/Common/irule-dyn"] = IRule(
+            full_path="/Common/irule-dyn",
+            partition="Common",
+            name="irule-dyn",
+            definition="pool $x",
+            has_dynamic_pool_selection=True,
+        )
+        parsed.virtuals["/Common/vs-web"].irules.append("/Common/irule-dyn")
+
+    result = analyze(mutate=mutate)
+    assert result.pool_verdicts["/Common/pool-idle"].verdict == Verdict.MANUAL_REVIEW
+
+
+def test_iapp_empty_pool_is_manual_review():
+    def mutate(parsed):
+        empty_pool("/Common/pool-idle")(parsed)
+        parsed.pools["/Common/pool-idle"].app_service = IAPP
+
+    result = analyze(mutate=mutate)
+    assert result.pool_verdicts["/Common/pool-idle"].verdict == Verdict.MANUAL_REVIEW
+
+
+def test_virtual_whose_only_pool_is_empty_is_offline_despite_unknown_availability():
+    result = analyze(mutate=empty_pool("/Common/pool-idle"))
+    verdict = result.virtual_verdicts["/Common/vs-idle"]
+    assert verdict.verdict == Verdict.OFFLINE_CANDIDATE
+    assert "has no members" in verdict.notes
+
+
+def test_virtual_with_empty_default_pool_and_live_irule_pool_is_not_offline():
+    def mutate(parsed):
+        empty_pool("/Common/pool-idle")(parsed)
+        parsed.virtuals["/Common/vs-idle"].irules.append("/Common/irule-static")
+
+    result = analyze(mutate=mutate)
+    assert result.virtual_verdicts["/Common/vs-idle"].verdict != Verdict.OFFLINE_CANDIDATE
+
+
+def test_empty_pool_is_skipped_on_standby():
+    result = analyze(standby=True, mutate=empty_pool("/Common/pool-idle"))
+    assert result.pool_verdicts["/Common/pool-idle"].verdict != Verdict.OFFLINE_CANDIDATE

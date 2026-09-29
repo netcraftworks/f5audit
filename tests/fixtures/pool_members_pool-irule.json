@@ -1,0 +1,12 @@
+[
+  {
+    "kind": "tm:ltm:pool:members:membersstate",
+    "name": "node-web-1:8080",
+    "partition": "Common",
+    "fullPath": "/Common/node-web-1:8080",
+    "address": "10.0.0.1",
+    "session": "monitor-enabled",
+    "state": "up",
+    "priorityGroup": 0
+  }
+]

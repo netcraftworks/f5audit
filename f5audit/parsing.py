@@ -22,6 +22,7 @@ from .models import (
     Pool,
     PoolMember,
     SystemInfo,
+    VirtualProfile,
     VirtualServer,
 )
 
@@ -404,6 +405,8 @@ def _parse_pool_member(
         admin_state=item.get("session", ""),
         availability=item.get("state", ""),
         priority_group=item.get("priorityGroup", 0),
+        ratio=item.get("ratio", 1),
+        connection_limit=item.get("connectionLimit", 0),
         app_service=iapp_owner(item, item.get("fullPath", "")),
     )
     entries = member_stats.get(f"{node_full_path}:{port}") or member_stats.get(
@@ -427,7 +430,12 @@ def _parse_pools(data: CollectionData, parsed: ParsedData) -> None:
             partition=item.get("partition", partition),
             name=item.get("name", ""),
             monitors=parse_monitor_refs(item.get("monitor"), partition),
+            monitor_expression=(item.get("monitor") or "").strip(),
             lb_method=item.get("loadBalancingMode", ""),
+            min_active_members=item.get("minActiveMembers", 0),
+            slow_ramp_time=item.get("slowRampTime", 10),
+            service_down_action=item.get("serviceDownAction", "none"),
+            description=item.get("description", ""),
             app_service=iapp_owner(item, full_path),
         )
         entries = pool_stats.get(full_path)
@@ -435,7 +443,9 @@ def _parse_pools(data: CollectionData, parsed: ParsedData) -> None:
             pool.availability = stat_value(entries, "status.availabilityState", "") or ""
             pool.total_conns = stat_value(entries, "serverside.totConns")
         member_stats = flatten_stats(data.get(f"ltm_pool_member_stats@{full_path}"))
-        for member_item in data.get(f"ltm_pool_members@{full_path}") or []:
+        member_items = data.get(f"ltm_pool_members@{full_path}")
+        pool.members_collected = member_items is not None
+        for member_item in member_items or []:
             pool.members.append(_parse_pool_member(member_item, pool.partition, member_stats))
         parsed.pools[full_path] = pool
 
@@ -448,22 +458,45 @@ def _parse_virtuals(data: CollectionData, parsed: ParsedData) -> None:
         destination = item.get("destination", "")
         # Destination comes as '/Common/10.0.0.1:443'; keep only ip:port.
         destination = destination.rsplit("/", 1)[-1]
+        snat = item.get("sourceAddressTranslation") or {}
         virtual = VirtualServer(
             full_path=full_path,
             partition=vs_partition,
             name=item.get("name", ""),
             destination=destination,
+            destination_path=item.get("destination", ""),
             default_pool=normalize_ref(item.get("pool"), vs_partition),
             irules=[normalize_ref(r, vs_partition) for r in item.get("rules") or []],
             persistence=[
                 normalize_ref(p.get("name"), p.get("partition", vs_partition))
                 for p in item.get("persist") or []
             ],
+            fallback_persistence=normalize_ref(item.get("fallbackPersistence"), vs_partition),
+            ip_protocol=item.get("ipProtocol", ""),
+            mask=item.get("mask", ""),
+            source=item.get("source", ""),
+            snat_type=snat.get("type", ""),
+            snat_pool=normalize_ref(snat.get("pool"), vs_partition),
+            vlans=[normalize_ref(v, vs_partition) for v in item.get("vlans") or []],
+            vlans_enabled=bool(item.get("vlansEnabled")),
+            translate_address=item.get("translateAddress", ""),
+            translate_port=item.get("translatePort", ""),
+            connection_limit=item.get("connectionLimit", 0),
+            description=item.get("description", ""),
             admin_state="disabled" if item.get("disabled") else "enabled",
             app_service=iapp_owner(item, full_path),
         )
         for policy_item in data.get(f"ltm_virtual_policies@{full_path}") or []:
             virtual.policies.append(_full_path(policy_item, vs_partition))
+        profile_items = data.get(f"ltm_virtual_profiles@{full_path}")
+        virtual.profiles_collected = profile_items is not None
+        for profile_item in profile_items or []:
+            virtual.profiles.append(
+                VirtualProfile(
+                    full_path=_full_path(profile_item, vs_partition),
+                    context=profile_item.get("context", "all"),
+                )
+            )
         entries = stats.get(full_path)
         if entries:
             virtual.total_conns = stat_value(entries, "clientside.totConns")
