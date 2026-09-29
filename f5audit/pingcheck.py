@@ -33,12 +33,12 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from .client import F5ClientError
-from .report import HEADER_FILL, MAX_COLUMN_WIDTH
+from .report import HEADER_FILL, MAX_COLUMN_WIDTH, PING_NOTE_HEADER, PING_STATUS_HEADER
 
 logger = logging.getLogger("f5audit.pingcheck")
 
-STATUS_HEADER = "Ping (from F5)"
-NOTE_HEADER = "Ping note"
+STATUS_HEADER = PING_STATUS_HEADER
+NOTE_HEADER = PING_NOTE_HEADER
 IP_HEADER = "IP"
 # IPs come only from Orphan Nodes: the sheet is by construction the list
 # of every node whose verdict is not IN USE, i.e. the removal candidates.

@@ -108,7 +108,9 @@ deletion conversation. The command reads the `IP` column of the
 node in several pools is pinged once), runs `ping` on the BIG-IP over
 SSH for each unique IPv4, and writes two columns into both the
 Inventory and Orphan Nodes sheets **in place**, replicating each IP's
-result across every row where it appears:
+result across every row where it appears (on Inventory it fills the
+`Ping (from F5)` / `Ping note` columns the report already reserves, so
+the other columns never move):
 
 | `Ping (from F5)` | Meaning |
 |---|---|
@@ -198,7 +200,9 @@ with warnings (standby device, denied partitions, missing endpoints).
    pool` is code analysis (every iRule whose Tcl contains `pool <this
    pool>`, whichever virtual server it is attached to). The latter, with
    `Policies forwarding to pool`, is the evidence that keeps a pool with no
-   default-pool reference from being `ORPHAN`.
+   default-pool reference from being `ORPHAN`. Columns `V:W` are reserved
+   for `f5audit ping`, and `X:AA` hold the change-request commands
+   described below.
 3. **Orphan Nodes** · 4. **Orphan-Inactive Pools** (with the same
    `iRules selecting pool` / `Policies forwarding to pool` evidence
    columns) · 5. **Inactive Virtual Servers** (with the attached
@@ -218,6 +222,34 @@ with warnings (standby device, denied partitions, missing endpoints).
 
 Color coding: red = ORPHAN · yellow = MANUAL REVIEW / UNRELIABLE ·
 orange = INACTIVE · purple = OFFLINE · green = IN USE.
+
+### Change-request columns (Inventory)
+
+Based on the row's **node verdict**, the Inventory sheet fills four
+columns with informational tmsh text (bare, for a `tmsh` shell) to paste
+into the change request. Nothing is generated as a script and nothing is
+executed.
+
+| Column | `OFFLINE (decommission candidate)` | `ORPHAN` |
+|---|---|---|
+| X `Remove node from pool` | `modify ltm pool <pool> members delete { <node>:<port> }` | — (no pool) |
+| Y `Delete node` | `delete ltm node <node>` | same |
+| Z `Create node (rollback)` | `create ltm node <node> address <ip>` | same |
+| AA `Add node back to pool (rollback)` | `modify ltm pool <pool> members add { <node>:<port> }` | — (no pool) |
+
+Every other verdict, `MANUAL REVIEW` and `UNRELIABLE` included, leaves the
+four cells blank. Details:
+
+- An `OFFLINE` node in several pools gets one row per pool. Run every
+  `members delete` line for that node first: `delete ltm node` fails
+  while the node is still a pool member.
+- The rollback restores what lives on the deleted objects: the node's own
+  monitor (`... monitor <monitor>`) when it is not `default`, and the
+  member's `{ priority-group N }` when N > 0. Pool monitors live on the
+  pool and need no rollback.
+- A node named by its IPv6 literal uses `.` before the port
+  (`/Common/2001:db8::10.443`); FQDN nodes are recreated with
+  `fqdn { name <host> }` instead of `address`.
 
 ### Network context columns (Inventory, Orphan Nodes)
 
