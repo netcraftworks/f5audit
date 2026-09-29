@@ -361,7 +361,7 @@ def _build_orphan_nodes(parsed: ParsedData, analysis: AnalysisResult) -> ReportT
                 node.monitor,
                 verdict.verdict,
                 verdict.notes,
-                f"tmsh delete ltm node {path}" if verdict.verdict == Verdict.ORPHAN else "",
+                f"delete ltm node {path}" if verdict.verdict == Verdict.ORPHAN else "",
             ]
             + _network_cells(parsed, node)
         )
@@ -401,7 +401,7 @@ def _build_pools(
                 _join(correlation.pool_to_policies.get(path, set())),
                 verdict.verdict,
                 verdict.notes,
-                f"tmsh delete ltm pool {path}" if verdict.verdict == Verdict.ORPHAN else "",
+                f"delete ltm pool {path}" if verdict.verdict == Verdict.ORPHAN else "",
             ]
         )
     return table
@@ -483,16 +483,16 @@ def _build_dead_chains(
             label = vs_verdict.verdict if vs_verdict else ""
             vs_verdict_labels.append(label)
             if label == Verdict.OFFLINE_CANDIDATE:
-                commands.append(f"tmsh delete ltm virtual {vs_path}")
+                commands.append(f"delete ltm virtual {vs_path}")
         if verdict.verdict == Verdict.OFFLINE_CANDIDATE:
-            commands.append(f"tmsh delete ltm pool {path}")
+            commands.append(f"delete ltm pool {path}")
         node_verdict_labels = []
         for node_path in node_paths:
             node_verdict = analysis.node_verdicts.get(node_path)
             label = node_verdict.verdict if node_verdict else ""
             node_verdict_labels.append(label)
             if label == Verdict.OFFLINE_CANDIDATE:
-                commands.append(f"tmsh delete ltm node {node_path}")
+                commands.append(f"delete ltm node {node_path}")
         table.rows.append(
             [
                 path,
@@ -533,7 +533,7 @@ def _build_orphan_monitors(parsed: ParsedData, analysis: AnalysisResult) -> Repo
                 monitor.partition,
                 verdict.verdict,
                 verdict.notes,
-                f"tmsh delete ltm monitor {monitor.type} {path}"
+                f"delete ltm monitor {monitor.type} {path}"
                 if verdict.verdict == Verdict.ORPHAN
                 else "",
             ]

@@ -11,7 +11,9 @@ pools, virtual servers, monitors) as input for a human-driven, change-
 controlled cleanup.
 
 **This tool never modifies the device.** The "suggested command" columns in
-the report are informational text only; nothing is ever executed.
+the report are informational text only; nothing is ever executed. They are
+written bare (`delete ltm node ...`, no `tmsh` prefix), for pasting into a
+tmsh shell during the change window.
 
 ## Safety design
 
@@ -212,7 +214,7 @@ with warnings (standby device, denied partitions, missing endpoints).
    `OFFLINE (decommission candidate)`, or `MANUAL REVIEW` when dynamic
    iRules cap it), grouping the whole chain (virtual servers → pool →
    member nodes) with per-object verdicts and the informational
-   `tmsh delete` lines to take to the config owner. Only objects with an
+   `delete` lines to take to the config owner. Only objects with an
    `OFFLINE` verdict get a delete line: a capped pool, or a node still
    alive in another pool, is listed without one.
 7. **Orphan Monitors** — filtered view with informational `tmsh`

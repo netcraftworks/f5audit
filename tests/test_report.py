@@ -81,7 +81,7 @@ def test_suggested_commands_only_for_orphans():
     for row in tables["pools"].rows:
         command = row[-1]
         if row[8] == Verdict.ORPHAN:
-            assert command.startswith("tmsh delete ltm pool ")
+            assert command.startswith("delete ltm pool ")
         else:
             # OFFLINE candidates included: their commands live only on the
             # Dead Chains sheet.
@@ -98,9 +98,9 @@ def test_dead_chains_sheet_groups_the_whole_chain():
     assert row[9] == Verdict.OFFLINE_CANDIDATE
     commands = row[-1].splitlines()
     assert commands == [
-        "tmsh delete ltm virtual /Common/vs-dead",
-        "tmsh delete ltm pool /Common/pool-dead",
-        "tmsh delete ltm node /Common/node-dead",
+        "delete ltm virtual /Common/vs-dead",
+        "delete ltm pool /Common/pool-dead",
+        "delete ltm node /Common/node-dead",
     ]
 
 
@@ -121,8 +121,8 @@ def test_dead_chains_sheet_omits_node_command_when_alive_elsewhere():
     tables = build_tables(parsed, correlation, analysis)
     row = tables["dead_chains"].rows[0]
     commands = row[-1].splitlines()
-    assert "tmsh delete ltm node /Common/node-dead" not in commands
-    assert "tmsh delete ltm pool /Common/pool-dead" in commands
+    assert "delete ltm node /Common/node-dead" not in commands
+    assert "delete ltm pool /Common/pool-dead" in commands
 
 
 def test_dead_chains_sheet_keeps_capped_pool_without_pool_command():
@@ -145,8 +145,8 @@ def test_dead_chains_sheet_keeps_capped_pool_without_pool_command():
     assert row[5] == Verdict.OFFLINE_CANDIDATE  # node verdict
     commands = row[-1].splitlines()
     assert commands == [
-        "tmsh delete ltm virtual /Common/vs-dead",
-        "tmsh delete ltm node /Common/node-dead",
+        "delete ltm virtual /Common/vs-dead",
+        "delete ltm node /Common/node-dead",
     ]
 
 
