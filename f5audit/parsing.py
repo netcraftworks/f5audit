@@ -267,6 +267,24 @@ def _full_path(item: dict[str, Any], partition: str) -> str:
     return item.get("fullPath") or f"/{item.get('partition', partition)}/{item.get('name', '')}"
 
 
+def iapp_owner(item: dict[str, Any], full_path: str) -> str:
+    """The iApp that owns an object, or '' when none.
+
+    BIG-IP sets 'appService' on every iApp-owned object; the '<name>.app'
+    folder an iApp always deploys into is the fallback. The folder is
+    matched per path segment (never the last one), so a node named
+    'portal.app01' or 'api.app.example.net' is not mistaken for an iApp.
+    """
+    app_service = item.get("appService")
+    if app_service:
+        return str(app_service)
+    segments = full_path.strip("/").split("/")
+    for index, segment in enumerate(segments[:-1]):
+        if segment.endswith(".app"):
+            return "/" + "/".join(segments[: index + 1])
+    return ""
+
+
 def parse_collection(data: CollectionData) -> ParsedData:
     parsed = ParsedData()
     parsed.system = _parse_system(data)
@@ -345,6 +363,7 @@ def _parse_nodes(data: CollectionData, parsed: ParsedData) -> None:
             address=item.get("address", item.get("fqdn", {}).get("tmName", "")),
             monitor=(item.get("monitor") or "").strip(),
             admin_state=item.get("session", ""),
+            app_service=iapp_owner(item, full_path),
         )
         entries = stats.get(full_path)
         if entries:
@@ -385,6 +404,7 @@ def _parse_pool_member(
         admin_state=item.get("session", ""),
         availability=item.get("state", ""),
         priority_group=item.get("priorityGroup", 0),
+        app_service=iapp_owner(item, item.get("fullPath", "")),
     )
     entries = member_stats.get(f"{node_full_path}:{port}") or member_stats.get(
         item.get("fullPath", "")
@@ -408,6 +428,7 @@ def _parse_pools(data: CollectionData, parsed: ParsedData) -> None:
             name=item.get("name", ""),
             monitors=parse_monitor_refs(item.get("monitor"), partition),
             lb_method=item.get("loadBalancingMode", ""),
+            app_service=iapp_owner(item, full_path),
         )
         entries = pool_stats.get(full_path)
         if entries:
@@ -439,6 +460,7 @@ def _parse_virtuals(data: CollectionData, parsed: ParsedData) -> None:
                 for p in item.get("persist") or []
             ],
             admin_state="disabled" if item.get("disabled") else "enabled",
+            app_service=iapp_owner(item, full_path),
         )
         for policy_item in data.get(f"ltm_virtual_policies@{full_path}") or []:
             virtual.policies.append(_full_path(policy_item, vs_partition))

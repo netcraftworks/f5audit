@@ -20,6 +20,7 @@ class Node:
     monitor_status: str = ""
     availability: str = ""
     total_conns: int | None = None
+    app_service: str = ""  # owning iApp, empty if none
 
 
 @dataclass
@@ -41,6 +42,7 @@ class PoolMember:
     cur_conns: int | None = None
     total_conns: int | None = None
     priority_group: int = 0
+    app_service: str = ""
 
 
 @dataclass
@@ -53,6 +55,7 @@ class Pool:
     members: list[PoolMember] = field(default_factory=list)
     availability: str = ""
     total_conns: int | None = None
+    app_service: str = ""
 
 
 @dataclass
@@ -71,6 +74,7 @@ class VirtualServer:
     total_conns: int | None = None
     bits_in: int | None = None
     bits_out: int | None = None
+    app_service: str = ""
 
 
 @dataclass
