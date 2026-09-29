@@ -13,6 +13,10 @@ Cross-cutting rules (spec section 8):
   not decommissioning. Every OFFLINE note says so.
 - Incomplete inventory (denied partitions/endpoints) degrades orphan
   verdicts, because a reference could live in an invisible partition.
+- Objects owned by an iApp (nodes, pools, virtual servers) are capped at
+  MANUAL REVIEW: with strict updates tmsh refuses to modify them, and
+  without it the next iApp reconfigure recreates them, so removal is an
+  iApp change, never a tmsh cleanup.
 """
 
 from __future__ import annotations
@@ -39,6 +43,9 @@ DEAD_MEMBER_STATES = {"offline", "down", "user-down"}
 # Node-level availability values meaning "no node-level monitor result";
 # for these nodes the dead-chain rule falls back to member evidence.
 UNMONITORED_NODE_STATES = {"", "unknown", "unchecked"}
+
+# Removal-candidate verdicts that the iApp ceiling degrades.
+IAPP_CAPPED_VERDICTS = {Verdict.ORPHAN, Verdict.OFFLINE_CANDIDATE, Verdict.INACTIVE}
 
 POINT_IN_TIME_NOTE = (
     "Availability is point-in-time; confirm with the config owner that this is not maintenance."
@@ -131,6 +138,8 @@ class Analyzer:
         self._analyze_pools(result)
         self._analyze_monitors(result)
         self._analyze_irules(result)
+        # Last, so the ceiling applies over every rule above.
+        self._apply_iapp_cap(result)
         return result
 
     def _collect_warnings(self, result: AnalysisResult) -> None:
@@ -464,6 +473,61 @@ class Analyzer:
                 result.monitor_verdicts[path] = ObjectVerdict(
                     Verdict.ORPHAN, "Not used by any node or pool."
                 )
+
+    # ------------------------------------------------------------------
+
+    def _pool_iapp(self, path: str) -> str:
+        pool = self.parsed.pools.get(path)
+        if pool is None:
+            return ""
+        if pool.app_service:
+            return pool.app_service
+        return next((m.app_service for m in pool.members if m.app_service), "")
+
+    def _node_iapp(self, path: str, node) -> str:
+        if node.app_service:
+            return node.app_service
+        for pool_path in sorted(self.correlation.node_to_pools.get(path, set())):
+            pool = self.parsed.pools.get(pool_path)
+            if pool is None:
+                continue
+            for member in pool.members:
+                if member.node_full_path == path and member.app_service:
+                    return member.app_service
+            owner = self._pool_iapp(pool_path)
+            if owner:
+                return owner
+        return ""
+
+    def _apply_iapp_cap(self, result: AnalysisResult) -> None:
+        owners = [
+            ("node", result.node_verdicts, path, self._node_iapp(path, node))
+            for path, node in self.parsed.nodes.items()
+        ]
+        owners += [
+            ("pool", result.pool_verdicts, path, self._pool_iapp(path))
+            for path in self.parsed.pools
+        ]
+        owners += [
+            ("virtual_server", result.virtual_verdicts, path, virtual.app_service)
+            for path, virtual in self.parsed.virtuals.items()
+        ]
+        for object_type, verdicts, path, app_service in owners:
+            current = verdicts.get(path)
+            if not app_service or current is None:
+                continue
+            if current.verdict not in IAPP_CAPPED_VERDICTS:
+                continue
+            evidence = f"{current.verdict}: {current.notes}" if current.notes else current.verdict
+            verdicts[path] = ObjectVerdict(
+                Verdict.MANUAL_REVIEW,
+                f"Owned by iApp {app_service}; tmsh cannot modify it (strict "
+                "updates), change it through the iApp. Underlying evidence: "
+                f"{evidence}",
+            )
+            result.manual_review.append(
+                ManualReviewItem(object_type, path, "Owned by an iApp", app_service)
+            )
 
     def _analyze_irules(self, result: AnalysisResult) -> None:
         for path, irule in self.parsed.irules.items():

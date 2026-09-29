@@ -5,6 +5,7 @@ from f5audit.parsing import (
     _parse_self_networks,
     analyze_irule_tcl,
     connectivity_note,
+    iapp_owner,
     normalize_ref,
     parse_collection,
     parse_monitor_refs,
@@ -354,3 +355,37 @@ def test_parse_collection_without_network_datasets():
     parsed = parse_collection(build_collection(network=False))
     assert parsed.network_collected is False
     assert parsed.network == {}
+
+
+# ---------------------------------------------------------------------------
+# iApp ownership
+# ---------------------------------------------------------------------------
+
+
+def test_iapp_owner_prefers_app_service_attribute():
+    item = {"appService": "/Windows/adfs.app/adfs"}
+    assert iapp_owner(item, "/Windows/10.0.0.10:443") == "/Windows/adfs.app/adfs"
+
+
+def test_iapp_owner_falls_back_to_app_folder():
+    path = (
+        "/Windows/Login.example.local_ADFS_Proxy.app/Login.example.local_ADFS_Proxy_adfs_pool_443"
+    )
+    assert iapp_owner({}, path) == "/Windows/Login.example.local_ADFS_Proxy.app"
+
+
+def test_iapp_owner_ignores_app_in_object_names():
+    assert iapp_owner({}, "/Common/portal.app01") == ""
+    assert iapp_owner({}, "/Common/api.app.example.net") == ""
+    assert iapp_owner({}, "/Common/pool.app") == ""  # last segment is the object
+    assert iapp_owner({}, "/Common/pool-web") == ""
+
+
+def test_parse_collection_reads_app_service():
+    data = build_collection()
+    data.datasets["ltm_pool_members@/Common/pool-dead"][0]["appService"] = "/Common/x.app/x"
+    parsed = parse_collection(data)
+    member = parsed.pools["/Common/pool-dead"].members[0]
+    assert member.app_service == "/Common/x.app/x"
+    assert parsed.pools["/Common/pool-web"].app_service == ""
+    assert parsed.nodes["/Common/node-dead"].app_service == ""

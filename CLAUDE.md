@@ -72,6 +72,9 @@ is the worst failure mode this tool has. Therefore:
   `MANUAL REVIEW` or `UNRELIABLE (incomplete inventory)`.
 - **Nothing touched by dynamic pool selection can be `ORPHAN`.** The ceiling is
   `MANUAL REVIEW`, always.
+- **Nothing owned by an iApp can be `ORPHAN`, `OFFLINE` or `INACTIVE`.** Nodes, pools
+  and virtual servers carrying `appService` (or living in a `<name>.app` folder) are
+  capped at `MANUAL REVIEW`: tmsh cannot remove them, only the iApp can.
 - **Traffic verdicts are only valid on the ACTIVE unit.** On standby, traffic analysis
   is skipped by default and marked `UNRELIABLE (standby)` under `--allow-standby`.
 - **Every traffic-based verdict carries counter-reset context** in its notes.

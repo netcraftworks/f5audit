@@ -405,3 +405,18 @@ def test_default_report_name():
     assert default_report_name("host", "csv").endswith(
         ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
     )
+
+
+def test_iapp_owned_objects_get_no_delete_commands():
+    parsed = parse_collection(build_collection())
+    for member in parsed.pools["/Common/pool-dead"].members:
+        member.app_service = "/Common/adfs.app/adfs"
+    correlation = correlate(parsed)
+    analysis = Analyzer(parsed, correlation).run()
+    tables = build_tables(parsed, correlation, analysis)
+    node_row = next(r for r in tables["orphan_nodes"].rows if r[0] == "/Common/node-dead")
+    assert node_row[4] == Verdict.MANUAL_REVIEW
+    assert node_row[6] == ""
+    chain = next(r for r in tables["dead_chains"].rows if r[0] == "/Common/pool-dead")
+    assert "delete ltm pool" not in chain[-1]
+    assert "delete ltm node" not in chain[-1]

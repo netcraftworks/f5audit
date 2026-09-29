@@ -377,3 +377,71 @@ def test_standby_with_flag_marks_traffic_verdicts_unreliable():
 def test_active_device_with_traffic_has_no_standby_warnings():
     result = analyze()
     assert not any("STANDBY" in warning for warning in result.warnings)
+
+
+# ---------------------------------------------------------------------------
+# iApp ownership ceiling
+# ---------------------------------------------------------------------------
+
+IAPP = "/Common/adfs.app/adfs"
+
+
+def own_dead_chain_by_member(parsed):
+    # appService only on the pool member, as BIG-IP reports it for iApp pools.
+    for member in parsed.pools["/Common/pool-dead"].members:
+        member.app_service = IAPP
+
+
+def test_iapp_member_caps_dead_node_and_pool_at_manual_review():
+    result = analyze(mutate=own_dead_chain_by_member)
+    node = result.node_verdicts["/Common/node-dead"]
+    assert node.verdict == Verdict.MANUAL_REVIEW
+    assert IAPP in node.notes
+    assert Verdict.OFFLINE_CANDIDATE in node.notes  # underlying evidence kept
+    pool = result.pool_verdicts["/Common/pool-dead"]
+    assert pool.verdict == Verdict.MANUAL_REVIEW
+    assert "/Common/pool-dead" in result.offline_pools  # still a dead chain
+    caused_by = {(i.object_type, i.full_path): i.caused_by for i in result.manual_review}
+    assert caused_by[("node", "/Common/node-dead")] == IAPP
+    assert caused_by[("pool", "/Common/pool-dead")] == IAPP
+
+
+def test_dead_chain_without_iapp_stays_offline():
+    result = analyze()
+    assert result.node_verdicts["/Common/node-dead"].verdict == Verdict.OFFLINE_CANDIDATE
+    assert not any(i.reason == "Owned by an iApp" for i in result.manual_review)
+
+
+def test_iapp_unreferenced_pool_is_not_orphan():
+    def own(parsed):
+        parsed.pools["/Common/pool-orphan"].app_service = IAPP
+
+    result = analyze(mutate=own)
+    assert result.pool_verdicts["/Common/pool-orphan"].verdict == Verdict.MANUAL_REVIEW
+
+
+def test_iapp_node_without_pool_is_not_orphan():
+    def own(parsed):
+        parsed.nodes["/Common/node-orphan"].app_service = IAPP
+
+    result = analyze(mutate=own)
+    assert result.node_verdicts["/Common/node-orphan"].verdict == Verdict.MANUAL_REVIEW
+
+
+def test_iapp_idle_virtual_is_not_inactive():
+    def own(parsed):
+        parsed.virtuals["/Common/vs-idle"].app_service = IAPP
+
+    result = analyze(mutate=own)
+    verdict = result.virtual_verdicts["/Common/vs-idle"]
+    assert verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "reset" in verdict.notes  # counter-reset context survives the cap
+
+
+def test_iapp_in_use_objects_stay_in_use():
+    def own(parsed):
+        parsed.pools["/Common/pool-web"].app_service = IAPP
+
+    result = analyze(mutate=own)
+    assert result.pool_verdicts["/Common/pool-web"].verdict == Verdict.IN_USE
+    assert result.node_verdicts["/Common/node-web-1"].verdict == Verdict.IN_USE
