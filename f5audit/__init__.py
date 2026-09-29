@@ -5,4 +5,4 @@ correlates object references, and reports orphaned / inactive objects
 as input for a human-driven, change-controlled cleanup.
 """
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
