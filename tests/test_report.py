@@ -420,3 +420,5 @@ def test_iapp_owned_objects_get_no_delete_commands():
     chain = next(r for r in tables["dead_chains"].rows if r[0] == "/Common/pool-dead")
     assert "delete ltm pool" not in chain[-1]
     assert "delete ltm node" not in chain[-1]
+    inventory = inventory_row(tables, "/Common/node-dead", "/Common/pool-dead")
+    assert inventory[CHANGE_COLUMNS] == ["", "", "", ""]
