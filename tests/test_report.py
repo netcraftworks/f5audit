@@ -6,10 +6,16 @@ from openpyxl import load_workbook
 
 from f5audit.analyzer import Analyzer, Verdict
 from f5audit.correlator import correlate
-from f5audit.models import IRule, PoolMember
+from f5audit.models import IRule, Node, PoolMember
 from f5audit.parsing import parse_collection
 from f5audit.report import build_tables, default_report_name, write_csv, write_xlsx
 from tests.conftest import build_collection
+
+# Inventory layout: network columns T:U, reserved ping columns V:W, and the
+# change-request columns X:AA the user copies into the change request.
+NETWORK_COLUMNS = slice(19, 21)
+PING_COLUMNS = slice(21, 23)
+CHANGE_COLUMNS = slice(23, 27)
 
 
 def make_tables():
@@ -167,14 +173,16 @@ def test_inventory_shows_node_and_pool_verdicts_separately():
 def test_network_columns_are_appended_to_inventory_and_orphan_nodes():
     _, tables = make_tables()
     inventory = tables["inventory"]
-    assert inventory.headers[-2:] == ["ARP MAC", "Network note"]
+    assert inventory.headers[NETWORK_COLUMNS] == ["ARP MAC", "Network note"]
     assert inventory.verdict_columns == (4, 17)  # unchanged by the appended columns
 
     member_row = next(
         r for r in inventory.rows if r[0] == "/Common/node-web-1" and r[5] == "/Common/pool-web"
     )
-    assert member_row[-2] == "00:00:5e:00:53:01"
-    assert member_row[-1] == "in ARP table (MAC 00:00:5e:00:53:01)"
+    assert member_row[NETWORK_COLUMNS] == [
+        "00:00:5e:00:53:01",
+        "in ARP table (MAC 00:00:5e:00:53:01)",
+    ]
 
     orphan_nodes = tables["orphan_nodes"]
     assert orphan_nodes.headers[-2:] == ["ARP MAC", "Network note"]
@@ -185,13 +193,132 @@ def test_network_columns_are_appended_to_inventory_and_orphan_nodes():
     assert rows["/Common/node-orphan"][-1] == "not directly connected (behind a router)"
 
 
+def analyze(parsed):
+    correlation = correlate(parsed)
+    analysis = Analyzer(parsed, correlation).run()
+    return build_tables(parsed, correlation, analysis)
+
+
+def inventory_row(tables, node_path, pool_path=None):
+    return next(
+        r
+        for r in tables["inventory"].rows
+        if r[0] == node_path and (pool_path is None or r[5] == pool_path)
+    )
+
+
+def test_inventory_change_columns_sit_at_x_through_aa():
+    _, tables = make_tables()
+    headers = tables["inventory"].headers
+    assert headers[PING_COLUMNS] == ["Ping (from F5)", "Ping note"]
+    assert headers[CHANGE_COLUMNS] == [
+        "Remove node from pool",
+        "Delete node",
+        "Create node (rollback)",
+        "Add node back to pool (rollback)",
+    ]
+    assert len(headers) == 27  # last column is AA
+    assert all(len(row) == len(headers) for row in tables["inventory"].rows)
+
+
+def test_inventory_change_commands_for_offline_node():
+    _, tables = make_tables()
+    row = inventory_row(tables, "/Common/node-dead", "/Common/pool-dead")
+    assert row[4] == Verdict.OFFLINE_CANDIDATE
+    assert row[PING_COLUMNS] == ["", ""]
+    assert row[CHANGE_COLUMNS] == [
+        "modify ltm pool /Common/pool-dead members delete { /Common/node-dead:443 }",
+        "delete ltm node /Common/node-dead",
+        # Non-default node monitor is restored: it is lost with the node.
+        "create ltm node /Common/node-dead address 10.0.0.50 monitor /Common/icmp",
+        "modify ltm pool /Common/pool-dead members add { /Common/node-dead:443 }",
+    ]
+
+
+def test_inventory_change_commands_for_orphan_node_skip_pool_columns():
+    _, tables = make_tables()
+    row = inventory_row(tables, "/Common/node-orphan")
+    assert row[4] == Verdict.ORPHAN
+    assert row[CHANGE_COLUMNS] == [
+        "",
+        "delete ltm node /Common/node-orphan",
+        "create ltm node /Common/node-orphan address 10.0.0.99 monitor /Common/icmp",
+        "",
+    ]
+
+
+def test_inventory_change_columns_blank_for_in_use_node():
+    _, tables = make_tables()
+    row = inventory_row(tables, "/Common/node-web-1", "/Common/pool-web")
+    assert row[4] == Verdict.IN_USE
+    assert row[CHANGE_COLUMNS] == ["", "", "", ""]
+
+
+def test_inventory_change_columns_blank_for_manual_review_node():
+    parsed = parse_collection(
+        build_collection(denied=[{"partition": "Secret", "endpoint": "/mgmt/tm/ltm/node"}])
+    )
+    tables = analyze(parsed)
+    row = inventory_row(tables, "/Common/node-orphan")
+    assert row[4] != Verdict.ORPHAN
+    assert row[CHANGE_COLUMNS] == ["", "", "", ""]
+
+
+def test_inventory_rollback_omits_default_node_monitor_and_keeps_priority_group():
+    parsed = parse_collection(build_collection())
+    parsed.nodes["/Common/node-dead"].monitor = "default"
+    parsed.pools["/Common/pool-dead"].members[0].priority_group = 10
+    row = inventory_row(analyze(parsed), "/Common/node-dead", "/Common/pool-dead")
+    assert row[CHANGE_COLUMNS][2] == "create ltm node /Common/node-dead address 10.0.0.50"
+    assert row[CHANGE_COLUMNS][3] == (
+        "modify ltm pool /Common/pool-dead members add "
+        "{ /Common/node-dead:443 { priority-group 10 } }"
+    )
+
+
+def test_inventory_change_commands_handle_ipv6_named_and_fqdn_nodes():
+    parsed = parse_collection(build_collection())
+    parsed.nodes["/Common/2001:db8::10"] = Node(
+        full_path="/Common/2001:db8::10",
+        partition="Common",
+        name="2001:db8::10",
+        address="2001:db8::10",
+        availability="offline",
+    )
+    parsed.nodes["/Common/app.example.net"] = Node(
+        full_path="/Common/app.example.net",
+        partition="Common",
+        name="app.example.net",
+        address="app.example.net",
+    )
+    parsed.pools["/Common/pool-dead"].members.append(
+        PoolMember(
+            node_full_path="/Common/2001:db8::10",
+            port="443",
+            partition="Common",
+            availability="offline",
+        )
+    )
+    tables = analyze(parsed)
+    ipv6_row = inventory_row(tables, "/Common/2001:db8::10", "/Common/pool-dead")
+    assert ipv6_row[4] == Verdict.OFFLINE_CANDIDATE
+    assert ipv6_row[CHANGE_COLUMNS][0] == (
+        "modify ltm pool /Common/pool-dead members delete { /Common/2001:db8::10.443 }"
+    )
+    fqdn_row = inventory_row(tables, "/Common/app.example.net")
+    assert fqdn_row[4] == Verdict.ORPHAN
+    assert fqdn_row[CHANGE_COLUMNS][2] == (
+        "create ltm node /Common/app.example.net fqdn { name app.example.net }"
+    )
+
+
 def test_network_columns_degrade_on_old_raw_cache():
     parsed = parse_collection(build_collection(network=False))
     correlation = correlate(parsed)
     analysis = Analyzer(parsed, correlation).run()
     tables = build_tables(parsed, correlation, analysis)
     row = next(r for r in tables["inventory"].rows if r[0] == "/Common/node-web-1")
-    assert row[-2:] == ["", "network data not collected"]
+    assert row[NETWORK_COLUMNS] == ["", "network data not collected"]
     summary = {str(r[0]): r[1] for r in tables["summary"].rows}
     assert summary["Network data (ARP/self-IP)"] == "not collected (old cache)"
 
@@ -202,7 +329,7 @@ def test_network_note_carries_standby_annotation():
     analysis = Analyzer(parsed, correlation).run()
     tables = build_tables(parsed, correlation, analysis)
     row = next(r for r in tables["inventory"].rows if r[0] == "/Common/node-web-1")
-    assert row[-1].endswith("[standby unit: ARP reflects this unit only]")
+    assert row[NETWORK_COLUMNS][1].endswith("[standby unit: ARP reflects this unit only]")
 
 
 def test_summary_reports_resumed_collection():

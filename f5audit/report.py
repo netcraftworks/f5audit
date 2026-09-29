@@ -1,12 +1,14 @@
 """Report generation: multi-sheet Excel workbook (openpyxl) or CSV set.
 
-The "suggested command" columns are informational text for the human
-running the change control; this tool never executes anything.
+The "suggested command" columns, and the Inventory change-request columns
+(remove / delete / rollback), are informational text for the human running
+the change control; this tool never executes anything.
 """
 
 from __future__ import annotations
 
 import csv
+import ipaddress
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -16,8 +18,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from .analyzer import AnalysisResult, Verdict
+from .analyzer import AnalysisResult, ObjectVerdict, Verdict
 from .correlator import Correlation
+from .models import Node, PoolMember
 from .parsing import ParsedData
 
 VERDICT_FILLS = {
@@ -32,6 +35,19 @@ VERDICT_FILLS = {
 
 HEADER_FILL = "D9D9D9"
 MAX_COLUMN_WIDTH = 60
+
+# Written by the opt-in `f5audit ping` post-process. The Inventory sheet
+# reserves these two columns up front so the change-request columns after
+# them keep a fixed position whether or not ping is ever run.
+PING_STATUS_HEADER = "Ping (from F5)"
+PING_NOTE_HEADER = "Ping note"
+
+CHANGE_HEADERS = [
+    "Remove node from pool",
+    "Delete node",
+    "Create node (rollback)",
+    "Add node back to pool (rollback)",
+]
 
 
 @dataclass
@@ -75,6 +91,57 @@ def _network_cells(parsed: ParsedData, node) -> list[object]:
     if note and parsed.system.failover_state == "standby":
         note += " [standby unit: ARP reflects this unit only]"
     return [info.arp_mac, note]
+
+
+def _member_ref(node_path: str, port: str) -> str:
+    # F5 quirk: a node named by its IPv6 literal separates the port with '.'.
+    node_name = node_path.rsplit("/", 1)[-1]
+    separator = "." if node_name.count(":") > 1 else ":"
+    return f"{node_path}{separator}{port}"
+
+
+def _node_create_command(node: Node) -> str:
+    ip_part = node.address.partition("%")[0]
+    try:
+        ipaddress.ip_address(ip_part)
+        target = f"address {node.address}"
+    except ValueError:
+        target = f"fqdn {{ name {node.address} }}"
+    command = f"create ltm node {node.full_path} {target}"
+    # The node-level monitor lives on the node object and is lost with it;
+    # the pool monitor survives on the pool and needs no rollback.
+    if node.monitor and node.monitor != "default":
+        command += f" monitor {node.monitor}"
+    return command
+
+
+def _change_cells(
+    node: Node | None,
+    node_verdict: ObjectVerdict | None,
+    pool_path: str | None,
+    member: PoolMember | None,
+) -> list[str]:
+    """[remove from pool, delete node, create node, add back to pool].
+
+    Only OFFLINE and ORPHAN nodes get commands; every other verdict
+    (including MANUAL REVIEW) stays blank, the conservative choice.
+    """
+    blank = ["", "", "", ""]
+    if node is None or node_verdict is None:
+        return blank
+    if node_verdict.verdict not in (Verdict.OFFLINE_CANDIDATE, Verdict.ORPHAN):
+        return blank
+    delete = f"delete ltm node {node.full_path}"
+    create = _node_create_command(node)
+    if node_verdict.verdict == Verdict.ORPHAN or member is None or not pool_path:
+        return ["", delete, create, ""]
+    reference = _member_ref(node.full_path, member.port)
+    remove = f"modify ltm pool {pool_path} members delete {{ {reference} }}"
+    add_member = reference
+    if member.priority_group:
+        add_member += f" {{ priority-group {member.priority_group} }}"
+    add = f"modify ltm pool {pool_path} members add {{ {add_member} }}"
+    return [remove, delete, create, add]
 
 
 def build_tables(
@@ -184,6 +251,9 @@ def _build_inventory(
         "Pool notes",
         "ARP MAC",
         "Network note",
+        PING_STATUS_HEADER,
+        PING_NOTE_HEADER,
+        *CHANGE_HEADERS,
     ]
     # Both verdict columns are colored independently: node verdict at 4,
     # pool verdict at 17.
@@ -226,6 +296,8 @@ def _build_inventory(
                     verdict.notes if verdict else "",
                 ]
                 + _network_cells(parsed, node)
+                + ["", ""]
+                + _change_cells(node, node_verdict, pool_path, member)
             )
 
     # Nodes that belong to no pool get their own rows.
@@ -258,6 +330,8 @@ def _build_inventory(
                 verdict.notes if verdict else "",
             ]
             + _network_cells(parsed, node)
+            + ["", ""]
+            + _change_cells(node, verdict, None, None)
         )
     return table
 

@@ -212,8 +212,9 @@ def test_enrich_workbook_replicates_results_across_sheets(tmp_path):
     for title in ("Inventory", "Orphan Nodes"):
         sheet = reloaded[title]
         headers = [cell.value for cell in sheet[1]]
-        assert headers[-2:] == ["Ping (from F5)", "Ping note"]
-        header_cell = sheet.cell(row=1, column=len(headers) - 1)
+        status_column = headers.index("Ping (from F5)") + 1
+        assert headers[status_column] == "Ping note"
+        header_cell = sheet.cell(row=1, column=status_column)
         assert header_cell.font.bold
         assert header_cell.fill.fgColor.rgb.endswith("D9D9D9")
         assert sheet.freeze_panes == "A2"
@@ -221,19 +222,44 @@ def test_enrich_workbook_replicates_results_across_sheets(tmp_path):
         by_ip = {}
         for row in range(2, sheet.max_row + 1):
             ip = sheet.cell(row=row, column=2).value
-            status = sheet.cell(row=row, column=len(headers) - 1).value
+            status = sheet.cell(row=row, column=status_column).value
             by_ip.setdefault(ip, set()).add(status)
         # Replicated on every row sharing the IP, on both sheets.
         assert by_ip.get("10.0.0.50") == {STATUS_NO}
         assert by_ip.get("10.0.0.99") == {STATUS_YES}
+    assert reloaded["Orphan Nodes"].cell(
+        row=1, column=reloaded["Orphan Nodes"].max_column - 1
+    ).value == ("Ping (from F5)")
     inventory = reloaded["Inventory"]
     for row in range(2, inventory.max_row + 1):
         ip = inventory.cell(row=row, column=2).value
-        status = inventory.cell(row=row, column=inventory.max_column - 1).value
+        status = inventory.cell(row=row, column=22).value
         if ip == "10.0.0.1":  # IN USE: never pinged, cells stay blank
             assert status in (None, "")
         if ip in (None, ""):  # "(no members)" rows
             assert status in (None, "")
+
+
+def test_enrich_workbook_fills_reserved_inventory_columns(tmp_path):
+    """The report reserves V:W on Inventory; ping fills them in place, so
+    the change-request columns X:AA never move."""
+    path = make_report(tmp_path)
+    workbook = load_report(str(path))
+    inventory = workbook["Inventory"]
+    columns_before = inventory.max_column
+    assert inventory["V1"].value == "Ping (from F5)"
+    assert inventory["W1"].value == "Ping note"
+    assert inventory["X1"].value == "Remove node from pool"
+
+    addresses, _ = collect_addresses(workbook)
+    results, _ = run_ping_checks(addresses, FakeRunner(reachable={"10.0.0.50"}))
+    enrich_workbook(workbook, results)
+
+    assert inventory.max_column == columns_before
+    assert inventory["X1"].value == "Remove node from pool"
+    assert inventory["AA1"].value == "Add node back to pool (rollback)"
+    statuses = {inventory.cell(row=row, column=22).value for row in range(2, inventory.max_row + 1)}
+    assert STATUS_YES in statuses
 
 
 def test_enrich_workbook_is_idempotent(tmp_path):
