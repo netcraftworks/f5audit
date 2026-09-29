@@ -89,6 +89,12 @@ re-fetched. Note the resulting cache mixes collection times (flagged on
 the Summary sheet); for a fully time-consistent snapshot, use a fresh
 directory.
 
+Virtual server profiles (`/mgmt/tm/ltm/virtual/<vs>/profiles`, one GET per
+virtual server, never `expandSubcollections`) feed the virtual server
+rollback commands. A cache collected before they existed has no profile
+files: its reports leave the virtual server rollback blank and say so.
+Resume `collect --save-raw` on that directory to backfill only them.
+
 ### One-step alternative
 
 ```
@@ -158,7 +164,7 @@ with warnings (standby device, denied partitions, missing endpoints).
 | `ORPHAN` | Not referenced by anything (node: no pool membership; pool: no VS/iRule/policy reference; monitor: no user). Only issued when the inventory is complete and no attached dynamic iRule can reach the object (see `MANUAL REVIEW`). |
 | `MANUAL REVIEW` | A dynamic iRule (`pool $var`, `pool [...]` — including datagroup lookups whose value reaches the `pool` command; a `class match` used only as a condition before `pool <literal>` is a static reference) or a missing `ltm/rule` endpoint means the object *could* be referenced at runtime. Never auto-cleanup these. A dynamic iRule attached to a virtual server reaches the pools of its own partition, the VS's partition, `/Common`, and any partition named literally (`/Partition/...`) in its Tcl; pools in other partitions are not affected, and nodes inherit the reach of their pools. Objects owned by an **iApp** are also capped here: a node, pool or virtual server that would otherwise be `ORPHAN`, `OFFLINE` or `INACTIVE` becomes `MANUAL REVIEW`, with the iApp name and the original evidence in the notes. Ownership is read from the `appService` attribute BIG-IP sets on iApp objects (for nodes, also through their pool membership), with the `<name>.app` folder as a fallback. With strict updates tmsh refuses to modify these objects, and without it the next iApp reconfigure recreates them, so removal has to go through the iApp. |
 | `INACTIVE` | Configured and referenced, but disabled or zero total connections since the last counter reset. |
-| `OFFLINE (decommission candidate)` | Referenced, but the whole dependency chain is monitor-offline: every member of the pool is down, so the pool and its virtual servers are offline. A deletion candidate to confirm with the config owner — availability is point-in-time, so it may also mean maintenance. A node is only included when it is dead in **every** pool it belongs to; a node alive in another pool stays `IN USE` ("in use elsewhere"). Only issued on the ACTIVE unit. A pool is capped at `MANUAL REVIEW` when an attached dynamic iRule can reach it (deleting the pool could break that iRule at runtime); its dead member nodes are not — dynamic iRules select pools, never nodes, and do not change pool membership. |
+| `OFFLINE (decommission candidate)` | Referenced, but the whole dependency chain is dead: the pool has **no members** (a configuration fact — it can load-balance to nothing), or every member of the pool is monitor-down, so the pool and its virtual servers are offline. A virtual server is included only when **every** pool it can reach (default pool, iRule and policy targets) is dead; BIG-IP reports a virtual server whose pools are all empty as `unknown`, so for those the empty pools alone are the evidence. A pool counts as empty only when its members subcollection was actually collected — a denied or missing `/members` response is unknown, never empty. A deletion candidate to confirm with the config owner — monitor availability is point-in-time, so it may also mean maintenance. A node is only included when it is dead in **every** pool it belongs to; a node alive in another pool stays `IN USE` ("in use elsewhere"). Only issued on the ACTIVE unit. A pool is capped at `MANUAL REVIEW` when an attached dynamic iRule can reach it (deleting the pool could break that iRule at runtime); its dead member nodes are not — dynamic iRules select pools, never nodes, and do not change pool membership. |
 | `UNRELIABLE (standby)` | Traffic-based verdict computed on a standby unit (only with `--allow-standby`). |
 | `UNRELIABLE (incomplete inventory)` | Some partitions were not readable; a reference could exist in an invisible partition. |
 | `IN USE` | Everything else. |
@@ -177,7 +183,7 @@ with warnings (standby device, denied partitions, missing endpoints).
   The raw cache already stores per-file timestamps to enable this.
 - Availability is **point-in-time**: an `OFFLINE` chain reflects monitor
   state at collection time and may mean maintenance rather than
-  decommissioning. Always confirm with the config owner before requesting
+  decommissioning (an empty pool is the exception: that is configuration). Always confirm with the config owner before requesting
   deletion.
 - The ARP table is also point-in-time and **per-unit**: "no ARP entry"
   on a local subnet means the host was idle (or down) at collection time
@@ -208,15 +214,13 @@ with warnings (standby device, denied partitions, missing endpoints).
 3. **Orphan Nodes** · 4. **Orphan-Inactive Pools** (with the same
    `iRules selecting pool` / `Policies forwarding to pool` evidence
    columns) · 5. **Inactive Virtual Servers** (with the attached
-   `iRules`) — filtered views with informational `tmsh` commands for the
-   change request.
-6. **Dead Chains** — one row per monitor-offline pool (verdict
-   `OFFLINE (decommission candidate)`, or `MANUAL REVIEW` when dynamic
-   iRules cap it), grouping the whole chain (virtual servers → pool →
-   member nodes) with per-object verdicts and the informational
-   `delete` lines to take to the config owner. Only objects with an
-   `OFFLINE` verdict get a delete line: a capped pool, or a node still
-   alive in another pool, is listed without one.
+   `iRules`) — filtered views with the change and rollback commands
+   described below.
+6. **Dead Chains** — one row per dead pool (empty or monitor-offline;
+   verdict `OFFLINE (decommission candidate)`, or `MANUAL REVIEW` when
+   dynamic iRules cap it), grouping the whole chain (virtual servers →
+   pool → member nodes) with per-object verdicts and the change and
+   rollback commands described below.
 7. **Orphan Monitors** — filtered view with informational `tmsh`
    commands.
 8. **Manual Review** — objects touched by dynamic logic, with the
@@ -247,11 +251,52 @@ four cells blank. Details:
   while the node is still a pool member.
 - The rollback restores what lives on the deleted objects: the node's own
   monitor (`... monitor <monitor>`) when it is not `default`, and the
-  member's `{ priority-group N }` when N > 0. Pool monitors live on the
+  member's non-default settings (`{ priority-group N ratio N
+  connection-limit N session user-disabled }`). Pool monitors live on the
   pool and need no rollback.
 - A node named by its IPv6 literal uses `.` before the port
   (`/Common/2001:db8::10.443`); FQDN nodes are recreated with
   `fqdn { name <host> }` instead of `address`.
+
+### Change and rollback columns (filtered sheets)
+
+Each filtered sheet carries one column per step, with the informational
+tmsh text relevant to that sheet. Only `ORPHAN` and `OFFLINE` rows get
+commands; every other verdict leaves them blank. Cells with several
+commands hold one per line. Syntax and order follow the official tmsh
+reference: change order is virtual servers → pool → nodes, rollback is
+the reverse.
+
+| Sheet | Columns |
+|---|---|
+| Orphan Nodes | `Remove node from pool(s)` (one `modify ltm pool ... members delete` per pool, `OFFLINE` only) · `Delete node` · `Create node (rollback)` · `Add node back to pool(s) (rollback)` |
+| Orphan-Inactive Pools | `Detach pool from virtual servers` (`modify ltm virtual <vs> pool none`, for each VS using it as default pool) · `Delete pool` · `Recreate pool (rollback)` · `Reattach pool to virtual servers (rollback)` |
+| Inactive Virtual Servers | `Delete virtual server` · `Recreate virtual server (rollback)` |
+| Dead Chains | `Delete virtual servers` · `Delete pool` · `Delete nodes` · `Recreate nodes (rollback)` · `Recreate pool (rollback)` · `Recreate virtual servers (rollback)` |
+
+- **Pools referenced by an iRule or an LTM policy** get no commands: tmsh
+  refuses `delete ltm pool` while an iRule names it literally or a policy
+  forwards to it, and editing Tcl or a policy draft is not something to
+  generate. The Notes column names the references to edit first.
+- **Dead Chains** only emits what tmsh would accept in that order: the
+  pool is deleted only when no virtual server that stays still uses it
+  as default pool, and a node only when this pool is deleted here and was
+  its last pool. Otherwise the Notes column points to the sheet with the
+  right commands.
+- **Pool rollback** restores members (with non-default `priority-group`,
+  `ratio`, `connection-limit`, disabled `session`), the monitor
+  expression as configured (`min 1 of { ... }` included),
+  `load-balancing-mode`, `min-active-members`, `slow-ramp-time`,
+  `service-down-action` and `description`. `members add` auto-creates
+  missing nodes with default settings, so recreate the nodes first.
+- **Virtual server rollback** restores destination, mask, protocol,
+  default pool, profiles with their context, iRules (in execution order),
+  policies, persistence, fallback persistence, source address
+  translation, VLANs, address/port translation, source, connection limit,
+  description and disabled state. Deleting the last virtual server on an
+  address also deletes its virtual-address (auto-delete); it comes back
+  with default settings, so the notes ask to record any non-default
+  virtual-address setting first.
 
 ### Network context columns (Inventory, Orphan Nodes)
 

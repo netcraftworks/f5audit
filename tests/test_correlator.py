@@ -12,7 +12,11 @@ def make_parsed():
 
 def test_node_to_pools():
     correlation = correlate(make_parsed())
-    assert correlation.node_to_pools["/Common/node-web-1"] == {"/Common/pool-web"}
+    assert correlation.node_to_pools["/Common/node-web-1"] == {
+        "/Common/pool-web",
+        "/Common/pool-irule",
+        "/Common/pool-idle",
+    }
     assert "/Common/node-orphan" not in correlation.node_to_pools
 
 

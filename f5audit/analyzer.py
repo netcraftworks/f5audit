@@ -10,7 +10,12 @@ Cross-cutting rules (spec section 8):
   standby rule: monitor results are per-unit and can differ from the
   active unit, so they are only trusted on the ACTIVE device.
 - Availability is point-in-time: an offline chain may be maintenance,
-  not decommissioning. Every OFFLINE note says so.
+  not decommissioning. Every monitor-based OFFLINE note says so.
+- A pool with no members is dead by configuration, not by monitor state:
+  it can load-balance to nothing. It joins the dead-pool set only when its
+  members subcollection was actually collected (a denied or missing
+  /members dataset is unknown, never empty), and it still goes through
+  the same standby, dynamic-iRule and iApp degradations as any OFFLINE.
 - Incomplete inventory (denied partitions/endpoints) degrades orphan
   verdicts, because a reference could live in an invisible partition.
 - Objects owned by an iApp (nodes, pools, virtual servers) are capped at
@@ -75,8 +80,8 @@ class AnalysisResult:
     manual_review: list[ManualReviewItem] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     stats_analysis_skipped: bool = False
-    # Pools whose whole chain is monitor-offline, whatever verdict that
-    # evidence finally received (OFFLINE, or its MANUAL REVIEW / standby
+    # Pools whose whole chain is dead (empty, or monitor-offline), whatever
+    # verdict that evidence finally received (OFFLINE, or its MANUAL REVIEW / standby
     # degradation). Drives the Dead Chains sheet.
     offline_pools: set[str] = field(default_factory=set)
 
@@ -97,13 +102,35 @@ def _conns_zero(total_conns: int | None) -> bool:
     return total_conns is not None and int(total_conns) == 0
 
 
+def _pool_is_empty(pool) -> bool:
+    return pool.members_collected and not pool.members
+
+
 def _pool_is_dead(pool) -> bool:
-    """Pool offline with every member down. availability is only ever
-    populated from ltm/pool/stats, so a missing stats endpoint self-gates
-    this rule (empty string is never 'offline')."""
+    """Pool with no members, or offline with every member down.
+    availability is only ever populated from ltm/pool/stats, so a missing
+    stats endpoint self-gates the monitor rule (empty string is never
+    'offline')."""
+    if _pool_is_empty(pool):
+        return True
     if pool.availability != "offline" or not pool.members:
         return False
     return all(member.availability in DEAD_MEMBER_STATES for member in pool.members)
+
+
+def _dead_pool_note(pool) -> str:
+    if _pool_is_empty(pool):
+        return (
+            "Pool has no members: it cannot load-balance to anything. "
+            "Configuration fact, not a point-in-time monitor state."
+        )
+    members_desc = ", ".join(
+        f"{member.node_full_path}:{member.port} ({member.availability})" for member in pool.members
+    )
+    return (
+        f"Pool offline: all {len(pool.members)} member(s) down "
+        f"({members_desc}). " + POINT_IN_TIME_NOTE
+    )
 
 
 class Analyzer:
@@ -247,17 +274,30 @@ class Analyzer:
         return ""
 
     def _virtual_is_dead(self, path: str, virtual) -> bool:
-        if virtual.availability != "offline":
-            return False
         if path in self.correlation.virtuals_with_unprovable_pool_selection:
             return False
         reachable = self.correlation.virtual_to_pools.get(path)
         if not reachable:
             return False
-        return all(
+        if not all(
             pool_path in self.parsed.pools and pool_path in self._dead_pools
             for pool_path in reachable
-        )
+        ):
+            return False
+        # BIG-IP reports a virtual whose pools are all empty as 'unknown',
+        # not 'offline': the empty pools are the evidence by themselves.
+        if all(_pool_is_empty(self.parsed.pools[pool_path]) for pool_path in reachable):
+            return True
+        return virtual.availability == "offline"
+
+    def _dead_pools_note(self, pool_paths) -> str:
+        pools = ", ".join(sorted(pool_paths))
+        empty = [_pool_is_empty(self.parsed.pools[pool_path]) for pool_path in pool_paths]
+        if all(empty):
+            return f"every reachable pool ({pools}) has no members."
+        state = "has no members or is offline" if any(empty) else "is offline"
+        note = f"every reachable pool ({pools}) {state} with all members down. "
+        return note + POINT_IN_TIME_NOTE
 
     def _offline_verdict(
         self,
@@ -324,14 +364,12 @@ class Analyzer:
                 )
                 continue
             if self._virtual_is_dead(path, virtual):
-                reachable = ", ".join(sorted(self.correlation.virtual_to_pools[path]))
                 emitted = self._offline_verdict(
                     result,
                     result.virtual_verdicts,
                     "virtual_server",
                     path,
-                    f"Offline: every reachable pool ({reachable}) is offline "
-                    "with all members down. " + POINT_IN_TIME_NOTE,
+                    "Offline: " + self._dead_pools_note(self.correlation.virtual_to_pools[path]),
                     # The VS's own pool selection is provably static and dead;
                     # dynamic iRules on other virtual servers do not change
                     # whether this VS can serve traffic.
@@ -377,17 +415,12 @@ class Analyzer:
                 continue
 
             if path in self._dead_pools:
-                members_desc = ", ".join(
-                    f"{member.node_full_path}:{member.port} ({member.availability})"
-                    for member in pool.members
-                )
                 emitted = self._offline_verdict(
                     result,
                     result.pool_verdicts,
                     "pool",
                     path,
-                    f"Pool offline: all {len(pool.members)} member(s) down "
-                    f"({members_desc}). " + POINT_IN_TIME_NOTE,
+                    _dead_pool_note(pool),
                     dynamic_irules=self.correlation.dynamic_irules_for_pool(path),
                 )
                 if emitted:

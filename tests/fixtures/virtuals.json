@@ -6,7 +6,9 @@
     "fullPath": "/Common/vs-web",
     "destination": "/Common/192.0.2.10:443",
     "pool": "/Common/pool-web",
-    "rules": ["/Common/irule-static"],
+    "rules": [
+      "/Common/irule-static"
+    ],
     "enabled": true
   },
   {
@@ -25,7 +27,29 @@
     "fullPath": "/Common/vs-dead",
     "destination": "/Common/192.0.2.13:443",
     "pool": "/Common/pool-dead",
-    "enabled": true
+    "enabled": true,
+    "mask": "255.255.255.255",
+    "ipProtocol": "tcp",
+    "source": "0.0.0.0/0",
+    "persist": [
+      {
+        "name": "cookie",
+        "partition": "Common",
+        "tmDefault": "yes"
+      }
+    ],
+    "fallbackPersistence": "/Common/source_addr",
+    "sourceAddressTranslation": {
+      "type": "snat",
+      "pool": "/Common/snat-example"
+    },
+    "vlansEnabled": true,
+    "vlans": [
+      "/Common/vlan-external"
+    ],
+    "translateAddress": "enabled",
+    "translatePort": "enabled",
+    "description": "Decommissioned app example.net"
   },
   {
     "kind": "tm:ltm:virtual:virtualstate",

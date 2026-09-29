@@ -199,7 +199,7 @@ class Collector:
             for partition in partitions:
                 self._collect_partition_config(partition)
             self._collect_pool_details()
-            self._collect_virtual_policies()
+            self._collect_virtual_details()
             self._collect_policy_rules()
             self._collect_monitors(partitions)
             self._collect_stats()
@@ -272,16 +272,22 @@ class Collector:
                 tolerate_404=True,
             )
 
-    def _collect_virtual_policies(self) -> None:
+    def _collect_virtual_details(self) -> None:
+        """Attached policies (correlation) and profiles (rollback commands).
+        Profiles are a subcollection: the virtual collection only carries a
+        link to them, and expanding it over every virtual is off-limits."""
         virtuals = self._iter_object_paths("ltm_virtual")
-        logger.info("Collecting attached policies for %d virtual servers...", len(virtuals))
+        logger.info(
+            "Collecting attached policies and profiles for %d virtual servers...", len(virtuals)
+        )
         for full_path in virtuals:
             encoded = encode_path_component(full_path)
-            self._fetch(
-                f"ltm_virtual_policies@{full_path}",
-                f"/mgmt/tm/ltm/virtual/{encoded}/policies",
-                tolerate_404=True,
-            )
+            for subcollection in ("policies", "profiles"):
+                self._fetch(
+                    f"ltm_virtual_{subcollection}@{full_path}",
+                    f"/mgmt/tm/ltm/virtual/{encoded}/{subcollection}",
+                    tolerate_404=True,
+                )
 
     def _collect_policy_rules(self) -> None:
         policies = self._iter_object_paths("ltm_policy")
