@@ -211,7 +211,14 @@ def test_dead_chains_sheet_omits_node_command_when_alive_elsewhere():
     row = table_row(analyze(parsed), "dead_chains", "/Common/pool-dead")
     assert row["Delete nodes"] == ""
     assert row["Recreate nodes (rollback)"] == ""
-    assert row["Delete pool"] == "delete ltm pool /Common/pool-dead"
+    # The IN USE node holds the pool and its virtual server at MANUAL
+    # REVIEW: the chain is listed, but nothing in it gets a command.
+    assert row["Node verdicts"] == Verdict.IN_USE
+    assert row["Verdict"] == Verdict.MANUAL_REVIEW
+    assert row["VS verdicts"] == Verdict.MANUAL_REVIEW
+    assert row["Delete pool"] == ""
+    assert row["Delete virtual servers"] == ""
+    assert "still IN USE" in row["Notes"]
 
 
 def test_dead_chains_sheet_keeps_capped_pool_without_pool_or_node_command():

@@ -204,25 +204,154 @@ def test_dead_chain_overrides_historical_traffic():
     assert verdict.verdict == Verdict.OFFLINE_CANDIDATE
 
 
-def test_node_offline_but_alive_in_another_pool_is_in_use():
-    def mutate(parsed):
-        parsed.pools["/Common/pool-web"].members.append(
-            PoolMember(
-                node_full_path="/Common/node-dead",
-                port="80",
-                partition="Common",
-                admin_state="monitor-enabled",
-                availability="available",
-            )
-        )
+def down_member(node_path, port):
+    return PoolMember(
+        node_full_path=node_path,
+        port=port,
+        partition="Common",
+        admin_state="monitor-enabled",
+        availability="offline",
+    )
 
-    result = analyze(mutate=mutate)
+
+def share_dead_node_with_live_pool(parsed):
+    parsed.pools["/Common/pool-web"].members.append(
+        PoolMember(
+            node_full_path="/Common/node-dead",
+            port="80",
+            partition="Common",
+            admin_state="monitor-enabled",
+            availability="available",
+        )
+    )
+
+
+def test_node_offline_but_alive_in_another_pool_is_in_use():
+    result = analyze(mutate=share_dead_node_with_live_pool)
     node_verdict = result.node_verdicts["/Common/node-dead"]
     assert node_verdict.verdict == Verdict.IN_USE
     assert "in use elsewhere" in node_verdict.notes
-    # The pool and virtual server are still decommission candidates.
+
+
+def test_dead_pool_with_node_alive_in_another_pool_is_manual_review():
+    result = analyze(mutate=share_dead_node_with_live_pool)
+    pool_verdict = result.pool_verdicts["/Common/pool-dead"]
+    assert pool_verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "Pool offline" in pool_verdict.notes
+    assert "/Common/node-dead: also a member of live pool(s) /Common/pool-web" in (
+        pool_verdict.notes
+    )
+    # Still a dead chain: it stays on the Dead Chains sheet.
+    assert "/Common/pool-dead" in result.offline_pools
+    # The hold propagates to the virtual server, naming the pool behind it.
+    virtual_verdict = result.virtual_verdicts["/Common/vs-dead"]
+    assert virtual_verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "pool /Common/pool-dead has member node(s) still IN USE" in virtual_verdict.notes
+    for object_type, path in (("pool", "/Common/pool-dead"), ("virtual_server", "/Common/vs-dead")):
+        assert any(
+            item.object_type == object_type
+            and item.full_path == path
+            and item.caused_by == "/Common/node-dead"
+            for item in result.manual_review
+        )
+
+
+def test_dead_pool_with_node_answering_its_node_monitor_is_manual_review():
+    def mutate(parsed):
+        # Server up (node-level monitor passes), service on the port down.
+        parsed.nodes["/Common/node-dead"].availability = "available"
+
+    result = analyze(mutate=mutate)
+    assert result.node_verdicts["/Common/node-dead"].verdict == Verdict.IN_USE
+    pool_verdict = result.pool_verdicts["/Common/pool-dead"]
+    assert pool_verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "answers its node-level monitor (availability: available)" in pool_verdict.notes
+    assert result.virtual_verdicts["/Common/vs-dead"].verdict == Verdict.MANUAL_REVIEW
+
+
+def test_dead_node_stays_offline_inside_pool_held_by_another_node():
+    def mutate(parsed):
+        share_dead_node_with_live_pool(parsed)
+        # node-orphan has no node-level monitor and lives only in pool-dead.
+        parsed.pools["/Common/pool-dead"].members.append(down_member("/Common/node-orphan", "443"))
+
+    result = analyze(mutate=mutate)
+    assert result.node_verdicts["/Common/node-orphan"].verdict == Verdict.OFFLINE_CANDIDATE
+    assert result.node_verdicts["/Common/node-dead"].verdict == Verdict.IN_USE
+    pool_verdict = result.pool_verdicts["/Common/pool-dead"]
+    assert pool_verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "/Common/node-orphan:" not in pool_verdict.notes.split("Held at MANUAL REVIEW")[1]
+
+
+def kill_idle_pool(parsed):
+    """The vs-idle chain goes monitor-dead; its node-web-1 lives on in pool-web."""
+    pool = parsed.pools["/Common/pool-idle"]
+    pool.availability = "offline"
+    pool.members[0].availability = "offline"
+    parsed.virtuals["/Common/vs-idle"].availability = "offline"
+
+
+def test_virtual_reaching_one_held_pool_among_dead_pools_is_manual_review():
+    def mutate(parsed):
+        kill_idle_pool(parsed)
+        parsed.irules["/Common/irule-idle"] = IRule(
+            full_path="/Common/irule-idle",
+            partition="Common",
+            name="irule-idle",
+            definition="pool pool-idle",
+            referenced_pools=["/Common/pool-idle"],
+        )
+        parsed.virtuals["/Common/vs-dead"].irules.append("/Common/irule-idle")
+
+    result = analyze(mutate=mutate)
+    # pool-dead itself has no IN USE node: only pool-idle is held.
+    assert result.pool_verdicts["/Common/pool-dead"].verdict == Verdict.OFFLINE_CANDIDATE
+    assert result.pool_verdicts["/Common/pool-idle"].verdict == Verdict.MANUAL_REVIEW
+    virtual_verdict = result.virtual_verdicts["/Common/vs-dead"]
+    assert virtual_verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "pool /Common/pool-idle has member node(s) still IN USE" in virtual_verdict.notes
+    assert "pool /Common/pool-dead has member" not in virtual_verdict.notes
+
+
+def test_held_pool_does_not_hold_unrelated_dead_chain():
+    result = analyze(mutate=kill_idle_pool)
+    assert result.pool_verdicts["/Common/pool-idle"].verdict == Verdict.MANUAL_REVIEW
+    assert result.virtual_verdicts["/Common/vs-idle"].verdict == Verdict.MANUAL_REVIEW
     assert result.pool_verdicts["/Common/pool-dead"].verdict == Verdict.OFFLINE_CANDIDATE
     assert result.virtual_verdicts["/Common/vs-dead"].verdict == Verdict.OFFLINE_CANDIDATE
+
+
+def test_unreferenced_dead_pool_with_in_use_node_stays_orphan():
+    def mutate(parsed):
+        pool = parsed.pools["/Common/pool-orphan"]
+        pool.availability = "offline"
+        pool.members.append(down_member("/Common/node-web-1", "9000"))
+
+    result = analyze(mutate=mutate)
+    assert result.node_verdicts["/Common/node-web-1"].verdict == Verdict.IN_USE
+    assert result.pool_verdicts["/Common/pool-orphan"].verdict == Verdict.ORPHAN
+
+
+def test_dynamic_irule_and_in_use_node_both_explain_the_manual_review():
+    def mutate(parsed):
+        attach_dynamic_irule(parsed)
+        share_dead_node_with_live_pool(parsed)
+
+    result = analyze(mutate=mutate)
+    pool_verdict = result.pool_verdicts["/Common/pool-dead"]
+    assert pool_verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "/Common/irule-dyn" in pool_verdict.notes
+    assert "still IN USE" in pool_verdict.notes
+    reasons = [
+        item.reason for item in result.manual_review if item.full_path == "/Common/pool-dead"
+    ]
+    assert len(reasons) == 2
+
+
+def test_standby_with_flag_outranks_in_use_node_hold():
+    result = analyze(standby=True, allow_standby=True, mutate=share_dead_node_with_live_pool)
+    assert result.pool_verdicts["/Common/pool-dead"].verdict == Verdict.UNRELIABLE_STANDBY
+    assert result.virtual_verdicts["/Common/vs-dead"].verdict == Verdict.UNRELIABLE_STANDBY
 
 
 def test_node_without_monitor_flagged_via_member_evidence():
