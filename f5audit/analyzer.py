@@ -16,6 +16,12 @@ Cross-cutting rules (spec section 8):
   members subcollection was actually collected (a denied or missing
   /members dataset is unknown, never empty), and it still goes through
   the same standby, dynamic-iRule and iApp degradations as any OFFLINE.
+- A monitor-dead pool with a member node whose verdict is IN USE is held
+  at MANUAL REVIEW, and so is a dead virtual server reaching such a pool:
+  the server behind it is alive (in a live pool, or answering its
+  node-level monitor), which looks like maintenance or a stopped service
+  rather than a decommission. Node verdicts are decided first, from the
+  raw dead-pool fact, so the dependency runs one way only.
 - Incomplete inventory (denied partitions/endpoints) degrades orphan
   verdicts, because a reference could live in an invisible partition.
 - Objects owned by an iApp (nodes, pools, virtual servers) are capped at
@@ -133,6 +139,19 @@ def _dead_pool_note(pool) -> str:
     )
 
 
+def _held_pools_note(held_pools: dict[str, dict[str, str]]) -> str:
+    pools_desc = "; ".join(
+        f"pool {pool_path} has member node(s) still IN USE ("
+        + ", ".join(f"{node}: {reason}" for node, reason in sorted(nodes.items()))
+        + ")"
+        for pool_path, nodes in sorted(held_pools.items())
+    )
+    return (
+        f"Held at MANUAL REVIEW: {pools_desc}. The server is alive, so this "
+        "looks like maintenance or a stopped service rather than a decommission."
+    )
+
+
 class Analyzer:
     def __init__(
         self, parsed: ParsedData, correlation: Correlation, *, allow_standby: bool = False
@@ -154,6 +173,9 @@ class Analyzer:
             f"{system.uptime or 'device uptime unknown'}."
         )
         self._dead_pools = {path for path, pool in parsed.pools.items() if _pool_is_dead(pool)}
+        # Dead pool -> {IN USE member node: why it is in use}. Filled once
+        # the node verdicts exist; holds pool and virtual verdicts back.
+        self._held_pools: dict[str, dict[str, str]] = {}
 
     # ------------------------------------------------------------------
 
@@ -161,6 +183,7 @@ class Analyzer:
         result = AnalysisResult()
         self._collect_warnings(result)
         self._analyze_nodes(result)
+        self._held_pools = self._pools_held_by_in_use_nodes(result)
         self._analyze_virtuals(result)
         self._analyze_pools(result)
         self._analyze_monitors(result)
@@ -224,6 +247,7 @@ class Analyzer:
                         # from a dead pool alters nothing at runtime. The
                         # cap belongs to the pool verdict only.
                         dynamic_irules=set(),
+                        held_pools={},
                     ):
                         continue
                 elif node.availability == "offline":
@@ -273,6 +297,32 @@ class Analyzer:
                 )
         return ""
 
+    def _pools_held_by_in_use_nodes(self, result: AnalysisResult) -> dict[str, dict[str, str]]:
+        held: dict[str, dict[str, str]] = {}
+        for pool_path in self._dead_pools:
+            in_use = {}
+            for member in self.parsed.pools[pool_path].members:
+                node_path = member.node_full_path
+                verdict = result.node_verdicts.get(node_path)
+                if verdict is None or verdict.verdict != Verdict.IN_USE:
+                    continue
+                in_use[node_path] = self._node_in_use_reason(node_path)
+            if in_use:
+                held[pool_path] = in_use
+        return held
+
+    def _node_in_use_reason(self, node_path: str) -> str:
+        """Why a member of a dead pool is IN USE all the same."""
+        live = sorted(
+            pool_path
+            for pool_path in self.correlation.node_to_pools.get(node_path, set())
+            if pool_path not in self._dead_pools
+        )
+        if live:
+            return f"also a member of live pool(s) {', '.join(live)}"
+        availability = self.parsed.nodes[node_path].availability or "unknown"
+        return f"answers its node-level monitor (availability: {availability})"
+
     def _virtual_is_dead(self, path: str, virtual) -> bool:
         if path in self.correlation.virtuals_with_unprovable_pool_selection:
             return False
@@ -308,10 +358,13 @@ class Analyzer:
         note: str,
         *,
         dynamic_irules: set[str],
+        held_pools: dict[str, dict[str, str]],
     ) -> bool:
         """Emit an availability-based OFFLINE verdict, degraded on standby
         and capped at MANUAL REVIEW when `dynamic_irules` (the attached
-        dynamic iRules that can reach the object) is non-empty.
+        dynamic iRules that can reach the object) or `held_pools` (the dead
+        pools in the chain that still have an IN USE member node) is
+        non-empty.
         Returns False when skipped so the caller falls through to the
         existing rules."""
         if self.is_standby:
@@ -323,12 +376,12 @@ class Analyzer:
                 "state may differ from the active unit. " + note,
             )
             return True
+        review_notes = []
         if dynamic_irules:
             dynamic = ", ".join(sorted(dynamic_irules))
-            verdicts[path] = ObjectVerdict(
-                Verdict.MANUAL_REVIEW,
-                note + " Dynamic pool-selection iRules are active "
-                f"({dynamic}); the object could still be selected at runtime.",
+            review_notes.append(
+                "Dynamic pool-selection iRules are active "
+                f"({dynamic}); the object could still be selected at runtime."
             )
             result.manual_review.append(
                 ManualReviewItem(
@@ -338,6 +391,19 @@ class Analyzer:
                     dynamic,
                 )
             )
+        if held_pools:
+            review_notes.append(_held_pools_note(held_pools))
+            in_use_nodes = sorted({node for nodes in held_pools.values() for node in nodes})
+            result.manual_review.append(
+                ManualReviewItem(
+                    object_type,
+                    path,
+                    "Offline decommission candidate, but a member node is IN USE",
+                    ", ".join(in_use_nodes),
+                )
+            )
+        if review_notes:
+            verdicts[path] = ObjectVerdict(Verdict.MANUAL_REVIEW, " ".join([note, *review_notes]))
             return True
         verdicts[path] = ObjectVerdict(Verdict.OFFLINE_CANDIDATE, note)
         return True
@@ -374,6 +440,11 @@ class Analyzer:
                     # dynamic iRules on other virtual servers do not change
                     # whether this VS can serve traffic.
                     dynamic_irules=set(),
+                    held_pools={
+                        pool_path: self._held_pools[pool_path]
+                        for pool_path in self.correlation.virtual_to_pools[path]
+                        if pool_path in self._held_pools
+                    },
                 )
                 if emitted:
                     continue
@@ -422,6 +493,7 @@ class Analyzer:
                     path,
                     _dead_pool_note(pool),
                     dynamic_irules=self.correlation.dynamic_irules_for_pool(path),
+                    held_pools=({path: self._held_pools[path]} if path in self._held_pools else {}),
                 )
                 if emitted:
                     result.offline_pools.add(path)

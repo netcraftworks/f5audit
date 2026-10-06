@@ -72,6 +72,10 @@ is the worst failure mode this tool has. Therefore:
   `MANUAL REVIEW` or `UNRELIABLE (incomplete inventory)`.
 - **Nothing touched by dynamic pool selection can be `ORPHAN`.** The ceiling is
   `MANUAL REVIEW`, always.
+- **A monitor-dead pool with an `IN USE` member node cannot be `OFFLINE`.** The pool,
+  and any dead virtual server reaching it, is capped at `MANUAL REVIEW`: the server
+  behind it is alive (in a live pool, or answering its node-level monitor), so the
+  outage may be maintenance. Node verdicts are decided first and do not depend on it.
 - **Nothing owned by an iApp can be `ORPHAN`, `OFFLINE` or `INACTIVE`.** Nodes, pools
   and virtual servers carrying `appService` (or living in a `<name>.app` folder) are
   capped at `MANUAL REVIEW`: tmsh cannot remove them, only the iApp can.
