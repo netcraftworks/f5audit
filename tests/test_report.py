@@ -244,6 +244,27 @@ def test_dead_chains_sheet_keeps_capped_pool_without_pool_or_node_command():
     assert "remove it from its pools first" in row["Notes"]
 
 
+def test_virtual_with_irule_gets_no_commands_on_any_sheet():
+    parsed = parse_collection(build_collection())
+    parsed.irules["/Common/irule-redirect"] = IRule(
+        full_path="/Common/irule-redirect",
+        partition="Common",
+        name="irule-redirect",
+        definition="when HTTP_REQUEST { HTTP::redirect https://example.net/ }",
+    )
+    parsed.virtuals["/Common/vs-dead"].irules.append("/Common/irule-redirect")
+    tables = analyze(parsed)
+    # The detach command would modify the held virtual server: all blank.
+    pool_row = table_row(tables, "pools", "/Common/pool-dead")
+    assert pool_row["Verdict"] == Verdict.MANUAL_REVIEW
+    assert [pool_row[h] for h in POOL_COMMAND_HEADERS] == ["", "", "", ""]
+    chain = table_row(tables, "dead_chains", "/Common/pool-dead")
+    assert chain["Verdict"] == Verdict.MANUAL_REVIEW
+    assert chain["VS verdicts"] == Verdict.MANUAL_REVIEW
+    assert chain["Delete virtual servers"] == ""
+    assert chain["Delete pool"] == ""
+
+
 def test_dead_chains_withholds_pool_delete_while_a_kept_virtual_uses_it():
     parsed = parse_collection(build_collection())
     parsed.virtuals["/Common/vs-dead"].app_service = "/Common/adfs.app/adfs"

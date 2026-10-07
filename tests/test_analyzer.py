@@ -2,7 +2,7 @@
 
 from f5audit.analyzer import POINT_IN_TIME_NOTE, Analyzer, Verdict
 from f5audit.correlator import correlate
-from f5audit.models import IRule, Pool, PoolMember, VirtualServer
+from f5audit.models import IRule, Policy, Pool, PoolMember, VirtualServer
 from f5audit.parsing import parse_collection
 from tests.conftest import build_collection
 
@@ -304,8 +304,11 @@ def test_virtual_reaching_one_held_pool_among_dead_pools_is_manual_review():
         parsed.virtuals["/Common/vs-dead"].irules.append("/Common/irule-idle")
 
     result = analyze(mutate=mutate)
-    # pool-dead itself has no IN USE node: only pool-idle is held.
-    assert result.pool_verdicts["/Common/pool-dead"].verdict == Verdict.OFFLINE_CANDIDATE
+    # pool-dead itself has no IN USE node: it is held only because its
+    # virtual server now carries an iRule.
+    pool_dead = result.pool_verdicts["/Common/pool-dead"]
+    assert pool_dead.verdict == Verdict.MANUAL_REVIEW
+    assert "still IN USE" not in pool_dead.notes
     assert result.pool_verdicts["/Common/pool-idle"].verdict == Verdict.MANUAL_REVIEW
     virtual_verdict = result.virtual_verdicts["/Common/vs-dead"]
     assert virtual_verdict.verdict == Verdict.MANUAL_REVIEW
@@ -661,8 +664,130 @@ def test_virtual_with_empty_default_pool_and_live_irule_pool_is_not_offline():
 
     result = analyze(mutate=mutate)
     assert result.virtual_verdicts["/Common/vs-idle"].verdict != Verdict.OFFLINE_CANDIDATE
+    # The empty default pool cannot be detached without touching a virtual
+    # server that is alive through its iRule.
+    pool_verdict = result.pool_verdicts["/Common/pool-idle"]
+    assert pool_verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "default pool of virtual server(s) /Common/vs-idle" in pool_verdict.notes
 
 
 def test_empty_pool_is_skipped_on_standby():
     result = analyze(standby=True, mutate=empty_pool("/Common/pool-idle"))
     assert result.pool_verdicts["/Common/pool-idle"].verdict != Verdict.OFFLINE_CANDIDATE
+
+
+# ---------------------------------------------------------------------------
+# iRules/policies attached to a dead virtual server
+# ---------------------------------------------------------------------------
+
+
+def attach_poolless_irule(virtual_path):
+    """A static iRule that answers by itself and names no pool."""
+
+    def mutate(parsed):
+        parsed.irules["/Common/irule-redirect"] = IRule(
+            full_path="/Common/irule-redirect",
+            partition="Common",
+            name="irule-redirect",
+            definition="when HTTP_REQUEST { HTTP::redirect https://example.net/ }",
+        )
+        parsed.virtuals[virtual_path].irules.append("/Common/irule-redirect")
+
+    return mutate
+
+
+def has_review_item(result, object_type, path, caused_by):
+    return any(
+        item.object_type == object_type and item.full_path == path and item.caused_by == caused_by
+        for item in result.manual_review
+    )
+
+
+def test_dead_virtual_with_irule_holds_virtual_and_pool_at_manual_review():
+    result = analyze(mutate=attach_poolless_irule("/Common/vs-dead"))
+    virtual_verdict = result.virtual_verdicts["/Common/vs-dead"]
+    assert virtual_verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "/Common/irule-redirect" in virtual_verdict.notes
+    assert "can answer traffic without a pool" in virtual_verdict.notes
+    pool_verdict = result.pool_verdicts["/Common/pool-dead"]
+    assert pool_verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "default pool of virtual server(s) /Common/vs-dead" in pool_verdict.notes
+    assert "/Common/pool-dead" in result.offline_pools
+    assert has_review_item(result, "virtual_server", "/Common/vs-dead", "/Common/irule-redirect")
+    assert has_review_item(result, "pool", "/Common/pool-dead", "/Common/vs-dead")
+    # Node verdicts never depend on the virtual server.
+    assert result.node_verdicts["/Common/node-dead"].verdict == Verdict.OFFLINE_CANDIDATE
+
+
+def test_dead_virtual_with_policy_holds_virtual_and_pool_at_manual_review():
+    def mutate(parsed):
+        parsed.policies["/Common/policy-redirect"] = Policy(
+            full_path="/Common/policy-redirect", partition="Common", name="policy-redirect"
+        )
+        parsed.virtuals["/Common/vs-dead"].policies.append("/Common/policy-redirect")
+
+    result = analyze(mutate=mutate)
+    virtual_verdict = result.virtual_verdicts["/Common/vs-dead"]
+    assert virtual_verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "/Common/policy-redirect" in virtual_verdict.notes
+    assert result.pool_verdicts["/Common/pool-dead"].verdict == Verdict.MANUAL_REVIEW
+
+
+def test_empty_pool_virtual_with_irule_holds_both_at_manual_review():
+    def mutate(parsed):
+        empty_pool("/Common/pool-idle")(parsed)
+        attach_poolless_irule("/Common/vs-idle")(parsed)
+
+    result = analyze(mutate=mutate)
+    assert result.virtual_verdicts["/Common/vs-idle"].verdict == Verdict.MANUAL_REVIEW
+    assert result.pool_verdicts["/Common/pool-idle"].verdict == Verdict.MANUAL_REVIEW
+
+
+def test_unreadable_irule_on_virtual_holds_its_dead_default_pool():
+    def mutate(parsed):
+        # Attached but absent from the inventory, as with ltm/rule denied.
+        parsed.virtuals["/Common/vs-dead"].irules.append("/Common/irule-unknown")
+
+    result = analyze(mutate=mutate)
+    # Pool selection is unprovable: the virtual server is never OFFLINE...
+    assert result.virtual_verdicts["/Common/vs-dead"].verdict == Verdict.IN_USE
+    # ...and its dead default pool must not be detached from it.
+    assert result.pool_verdicts["/Common/pool-dead"].verdict == Verdict.MANUAL_REVIEW
+
+
+def test_dynamic_irule_on_dead_virtual_holds_pool_once_per_cause():
+    def mutate(parsed):
+        attach_dynamic_irule(parsed)
+        parsed.virtuals["/Common/vs-dead"].irules.append("/Common/irule-dyn")
+
+    result = analyze(mutate=mutate)
+    pool_verdict = result.pool_verdicts["/Common/pool-dead"]
+    assert pool_verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "Dynamic pool-selection iRules are active" in pool_verdict.notes
+    assert "default pool of virtual server(s) /Common/vs-dead" in pool_verdict.notes
+    items = [item for item in result.manual_review if item.full_path == "/Common/pool-dead"]
+    assert len(items) == 2
+
+
+def test_dead_chain_without_attached_logic_stays_offline():
+    # An iRule on another virtual server does not hold this chain.
+    result = analyze(mutate=attach_poolless_irule("/Common/vs-web"))
+    assert result.virtual_verdicts["/Common/vs-dead"].verdict == Verdict.OFFLINE_CANDIDATE
+    assert result.pool_verdicts["/Common/pool-dead"].verdict == Verdict.OFFLINE_CANDIDATE
+
+
+def test_dead_pool_reached_only_through_irule_reference_is_not_held_by_attached_logic():
+    def mutate(parsed):
+        # pool-irule is named by irule-static on vs-web, never a default pool.
+        parsed.pools["/Common/pool-irule"].members = []
+
+    result = analyze(mutate=mutate)
+    assert result.pool_verdicts["/Common/pool-irule"].verdict == Verdict.OFFLINE_CANDIDATE
+
+
+def test_standby_with_flag_outranks_attached_logic_hold():
+    result = analyze(
+        standby=True, allow_standby=True, mutate=attach_poolless_irule("/Common/vs-dead")
+    )
+    assert result.virtual_verdicts["/Common/vs-dead"].verdict == Verdict.UNRELIABLE_STANDBY
+    assert result.pool_verdicts["/Common/pool-dead"].verdict == Verdict.UNRELIABLE_STANDBY
