@@ -136,14 +136,17 @@ def test_pool_commands_only_for_orphan_and_offline():
     assert inactive["Recreate pool (rollback)"] == ""
 
 
-def test_pool_commands_withheld_when_an_irule_or_policy_references_it():
+def test_dead_pool_named_by_an_irule_is_manual_review_without_commands():
     parsed = parse_collection(build_collection())
-    parsed.pools["/Common/pool-irule"].members = []  # empty: OFFLINE via vs-web's iRule
+    parsed.pools["/Common/pool-irule"].members = []  # empty, named by vs-web's iRule
     tables = analyze(parsed)
     row = table_row(tables, "pools", "/Common/pool-irule")
-    assert row["Verdict"] == Verdict.OFFLINE_CANDIDATE
+    assert row["Verdict"] == Verdict.MANUAL_REVIEW
     assert [row[h] for h in POOL_COMMAND_HEADERS] == ["", "", "", ""]
-    assert "Commands withheld: referenced by iRule(s) /Common/irule-static" in row["Notes"]
+    assert "referenced by iRule(s) /Common/irule-static" in row["Notes"]
+    chain = table_row(tables, "dead_chains", "/Common/pool-irule")
+    assert chain["Verdict"] == Verdict.MANUAL_REVIEW
+    assert chain["Delete pool"] == ""
 
 
 def test_virtual_commands_for_offline_virtual():

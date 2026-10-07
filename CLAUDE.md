@@ -79,7 +79,9 @@ is the worst failure mode this tool has. Therefore:
 - **A dead virtual server with an iRule or policy attached cannot be `OFFLINE`.** That
   logic can answer traffic without a pool, so the ceiling is `MANUAL REVIEW`. The same
   ceiling applies to a dead pool that is the default pool of a virtual server carrying
-  iRules or policies: detaching it would modify that virtual server.
+  iRules or policies (detaching it would modify that virtual server), and to a dead
+  pool that an iRule names or a policy forwards to (tmsh refuses the delete until that
+  logic is edited by hand).
 - **Nothing owned by an iApp can be `ORPHAN`, `OFFLINE` or `INACTIVE`.** Nodes, pools
   and virtual servers carrying `appService` (or living in a `<name>.app` folder) are
   capped at `MANUAL REVIEW`: tmsh cannot remove them, only the iApp can.

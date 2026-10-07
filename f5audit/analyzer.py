@@ -29,6 +29,9 @@ Cross-cutting rules (spec section 8):
   iRules or policies is held too, whatever that virtual server's verdict:
   deleting it means detaching it from a virtual server whose logic may
   rely on the default pool.
+- A dead pool that a static iRule names or a policy forwards to is held
+  at MANUAL REVIEW as well: tmsh refuses the delete until that Tcl or
+  policy is edited by hand, on a virtual server that is likely in use.
 - Incomplete inventory (denied partitions/endpoints) degrades orphan
   verdicts, because a reference could live in an invisible partition.
 - Objects owned by an iApp (nodes, pools, virtual servers) are capped at
@@ -39,6 +42,7 @@ Cross-cutting rules (spec section 8):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from .correlator import Correlation, is_builtin_monitor
@@ -86,8 +90,8 @@ class ManualReviewItem:
 
 @dataclass
 class AttachedLogicHold:
-    """Why iRules/policies on a virtual server keep an otherwise dead
-    object at MANUAL REVIEW."""
+    """Why iRules/policies (attached to a virtual server, or referencing a
+    pool) keep an otherwise dead object at MANUAL REVIEW."""
 
     note: str
     reason: str
@@ -166,6 +170,24 @@ def _held_pools_note(held_pools: dict[str, dict[str, str]]) -> str:
     return (
         f"Held at MANUAL REVIEW: {pools_desc}. The server is alive, so this "
         "looks like maintenance or a stopped service rather than a decommission."
+    )
+
+
+def _pool_reference_hold(irule_refs, policy_refs) -> AttachedLogicHold | None:
+    """Hold for a dead pool that an iRule names literally or a policy
+    forwards to, whether or not that iRule/policy is attached anywhere."""
+    reasons = []
+    if irule_refs:
+        reasons.append(f"iRule(s) {', '.join(sorted(irule_refs))}")
+    if policy_refs:
+        reasons.append(f"policy(ies) {', '.join(sorted(policy_refs))}")
+    if not reasons:
+        return None
+    return AttachedLogicHold(
+        f"Held at MANUAL REVIEW: referenced by {' and '.join(reasons)}; tmsh "
+        "refuses the delete until those references are edited by hand.",
+        "Offline decommission candidate, but an iRule/policy references it",
+        ", ".join(sorted(irule_refs | policy_refs)),
     )
 
 
@@ -376,13 +398,13 @@ class Analyzer:
         *,
         dynamic_irules: set[str],
         held_pools: dict[str, dict[str, str]],
-        attached_logic: AttachedLogicHold | None = None,
+        attached_logic: Sequence[AttachedLogicHold] = (),
     ) -> bool:
         """Emit an availability-based OFFLINE verdict, degraded on standby
         and capped at MANUAL REVIEW when `dynamic_irules` (the attached
         dynamic iRules that can reach the object) or `held_pools` (the dead
         pools in the chain that still have an IN USE member node) is
-        non-empty, or when `attached_logic` is given.
+        non-empty, or when `attached_logic` carries any hold.
         Returns False when skipped so the caller falls through to the
         existing rules."""
         if self.is_standby:
@@ -420,10 +442,10 @@ class Analyzer:
                     ", ".join(in_use_nodes),
                 )
             )
-        if attached_logic:
-            review_notes.append(attached_logic.note)
+        for hold in attached_logic:
+            review_notes.append(hold.note)
             result.manual_review.append(
-                ManualReviewItem(object_type, path, attached_logic.reason, attached_logic.caused_by)
+                ManualReviewItem(object_type, path, hold.reason, hold.caused_by)
             )
         if review_notes:
             verdicts[path] = ObjectVerdict(Verdict.MANUAL_REVIEW, " ".join([note, *review_notes]))
@@ -468,7 +490,7 @@ class Analyzer:
                         for pool_path in self.correlation.virtual_to_pools[path]
                         if pool_path in self._held_pools
                     },
-                    attached_logic=self._virtual_logic_hold(virtual),
+                    attached_logic=[hold for hold in [self._virtual_logic_hold(virtual)] if hold],
                 )
                 if emitted:
                     continue
@@ -556,7 +578,14 @@ class Analyzer:
                     _dead_pool_note(pool),
                     dynamic_irules=self.correlation.dynamic_irules_for_pool(path),
                     held_pools=({path: self._held_pools[path]} if path in self._held_pools else {}),
-                    attached_logic=self._pool_logic_hold(virtuals),
+                    attached_logic=[
+                        hold
+                        for hold in (
+                            self._pool_logic_hold(virtuals),
+                            _pool_reference_hold(irule_refs, policy_refs),
+                        )
+                        if hold
+                    ],
                 )
                 if emitted:
                     result.offline_pools.add(path)
