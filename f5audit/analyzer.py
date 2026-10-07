@@ -22,6 +22,13 @@ Cross-cutting rules (spec section 8):
   node-level monitor), which looks like maintenance or a stopped service
   rather than a decommission. Node verdicts are decided first, from the
   raw dead-pool fact, so the dependency runs one way only.
+- A dead virtual server with any iRule or policy attached is held at
+  MANUAL REVIEW: that logic can answer traffic without a pool (redirect,
+  direct response), so dead pools do not prove the virtual server unused.
+  A dead pool that is the default pool of a virtual server carrying
+  iRules or policies is held too, whatever that virtual server's verdict:
+  deleting it means detaching it from a virtual server whose logic may
+  rely on the default pool.
 - Incomplete inventory (denied partitions/endpoints) degrades orphan
   verdicts, because a reference could live in an invisible partition.
 - Objects owned by an iApp (nodes, pools, virtual servers) are capped at
@@ -75,6 +82,16 @@ class ManualReviewItem:
     full_path: str
     reason: str
     caused_by: str = ""
+
+
+@dataclass
+class AttachedLogicHold:
+    """Why iRules/policies on a virtual server keep an otherwise dead
+    object at MANUAL REVIEW."""
+
+    note: str
+    reason: str
+    caused_by: str
 
 
 @dataclass
@@ -359,12 +376,13 @@ class Analyzer:
         *,
         dynamic_irules: set[str],
         held_pools: dict[str, dict[str, str]],
+        attached_logic: AttachedLogicHold | None = None,
     ) -> bool:
         """Emit an availability-based OFFLINE verdict, degraded on standby
         and capped at MANUAL REVIEW when `dynamic_irules` (the attached
         dynamic iRules that can reach the object) or `held_pools` (the dead
         pools in the chain that still have an IN USE member node) is
-        non-empty.
+        non-empty, or when `attached_logic` is given.
         Returns False when skipped so the caller falls through to the
         existing rules."""
         if self.is_standby:
@@ -401,6 +419,11 @@ class Analyzer:
                     "Offline decommission candidate, but a member node is IN USE",
                     ", ".join(in_use_nodes),
                 )
+            )
+        if attached_logic:
+            review_notes.append(attached_logic.note)
+            result.manual_review.append(
+                ManualReviewItem(object_type, path, attached_logic.reason, attached_logic.caused_by)
             )
         if review_notes:
             verdicts[path] = ObjectVerdict(Verdict.MANUAL_REVIEW, " ".join([note, *review_notes]))
@@ -445,6 +468,7 @@ class Analyzer:
                         for pool_path in self.correlation.virtual_to_pools[path]
                         if pool_path in self._held_pools
                     },
+                    attached_logic=self._virtual_logic_hold(virtual),
                 )
                 if emitted:
                     continue
@@ -456,6 +480,44 @@ class Analyzer:
                 )
                 continue
             result.virtual_verdicts[path] = ObjectVerdict(Verdict.IN_USE)
+
+    def _virtual_logic_hold(self, virtual) -> AttachedLogicHold | None:
+        attached = ", ".join(virtual.irules + virtual.policies)
+        if not attached:
+            return None
+        return AttachedLogicHold(
+            f"Held at MANUAL REVIEW: attached iRule(s)/policy(ies) ({attached}) can "
+            "answer traffic without a pool (redirect, direct response), so dead "
+            "pools do not prove the virtual server is unused.",
+            "Offline decommission candidate, but iRules/policies are attached",
+            attached,
+        )
+
+    def _pool_logic_hold(self, default_pool_virtuals) -> AttachedLogicHold | None:
+        """Hold for a dead pool that is the default pool of virtual servers
+        carrying iRules or policies. Read from the attachment lists, not
+        from the virtual server verdicts, so an in-use virtual server or one
+        whose iRule was unreadable holds its dead default pool as well."""
+        with_logic = ", ".join(
+            sorted(
+                virtual_path
+                for virtual_path in default_pool_virtuals
+                if virtual_path in self.parsed.virtuals
+                and (
+                    self.parsed.virtuals[virtual_path].irules
+                    or self.parsed.virtuals[virtual_path].policies
+                )
+            )
+        )
+        if not with_logic:
+            return None
+        return AttachedLogicHold(
+            f"Held at MANUAL REVIEW: default pool of virtual server(s) {with_logic} "
+            "carrying iRules/policies; deleting it means detaching it from a "
+            "virtual server whose iRule/policy logic may rely on the default pool.",
+            "Offline decommission candidate, but its virtual server has iRules/policies attached",
+            with_logic,
+        )
 
     def _traffic_verdict(self, verdicts: dict[str, ObjectVerdict], path: str, note: str) -> None:
         """Emit a traffic-based INACTIVE verdict, degraded on standby."""
@@ -494,6 +556,7 @@ class Analyzer:
                     _dead_pool_note(pool),
                     dynamic_irules=self.correlation.dynamic_irules_for_pool(path),
                     held_pools=({path: self._held_pools[path]} if path in self._held_pools else {}),
+                    attached_logic=self._pool_logic_hold(virtuals),
                 )
                 if emitted:
                     result.offline_pools.add(path)
