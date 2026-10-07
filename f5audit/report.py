@@ -188,24 +188,6 @@ def _node_command_cells(parsed: ParsedData, node: Node, verdict: ObjectVerdict) 
     ]
 
 
-def _pool_blockers(correlation: Correlation, pool_path: str) -> str:
-    """Why tmsh would refuse to delete the pool, or empty when nothing we
-    cannot detach from here references it."""
-    reasons = []
-    irules = correlation.pool_to_irules.get(pool_path)
-    if irules:
-        reasons.append(f"iRule(s) {_join(irules)}")
-    policies = correlation.pool_to_policies.get(pool_path)
-    if policies:
-        reasons.append(f"policy(ies) {_join(policies)}")
-    if not reasons:
-        return ""
-    return (
-        f"Commands withheld: referenced by {' and '.join(reasons)}; tmsh refuses "
-        "the delete until those references are edited."
-    )
-
-
 def _with_note(notes: str, extra: str) -> str:
     return f"{notes} {extra}".strip() if extra else notes
 
@@ -468,7 +450,7 @@ def _build_pools(
         if verdict.verdict == Verdict.IN_USE:
             continue
         pool = parsed.pools[path]
-        cells, note = _pool_command_cells(correlation, pool, verdict)
+        cells = _pool_command_cells(correlation, pool, verdict)
         table.rows.append(
             [
                 path,
@@ -480,31 +462,26 @@ def _build_pools(
                 _join(correlation.pool_to_irules.get(path, set())),
                 _join(correlation.pool_to_policies.get(path, set())),
                 verdict.verdict,
-                _with_note(verdict.notes, note),
+                verdict.notes,
                 *cells,
             ]
         )
     return table
 
 
-def _pool_command_cells(
-    correlation: Correlation, pool: Pool, verdict: ObjectVerdict
-) -> tuple[list[str], str]:
-    """(POOL_COMMAND_HEADERS cells, extra note). Detach covers only default
-    pools; an iRule or policy reference withholds every command."""
-    blank = ["", "", "", ""]
+def _pool_command_cells(correlation: Correlation, pool: Pool, verdict: ObjectVerdict) -> list[str]:
+    """POOL_COMMAND_HEADERS cells. Detach covers default pools, the only
+    reference a pool with a command verdict can have: one named by an iRule
+    or a policy is never ORPHAN, and MANUAL REVIEW when dead."""
     if not _has_commands(verdict):
-        return blank, ""
-    blockers = _pool_blockers(correlation, pool.full_path)
-    if blockers:
-        return blank, blockers
+        return ["", "", "", ""]
     virtuals = sorted(correlation.pool_to_virtuals.get(pool.full_path, set()))
     return [
         "\n".join(commands.detach_pool_command(vs) for vs in virtuals),
         commands.delete_pool_command(pool.full_path),
         commands.pool_create_command(pool),
         "\n".join(commands.reattach_pool_command(vs, pool.full_path) for vs in virtuals),
-    ], ""
+    ]
 
 
 def _build_inactive_virtuals(parsed: ParsedData, analysis: AnalysisResult) -> ReportTable:
@@ -597,10 +574,7 @@ def _build_dead_chains(
         if _has_commands(verdict):
             deleted_paths = {virtual.full_path for virtual in deleted_virtuals}
             kept = sorted(correlation.pool_to_virtuals.get(path, set()) - deleted_paths)
-            blockers = _pool_blockers(correlation, path)
-            if blockers:
-                notes.append(blockers)
-            elif kept:
+            if kept:
                 notes.append(
                     f"Pool not deleted: still the default pool of {', '.join(kept)}, "
                     "which is not a removal candidate (see Orphan-Inactive Pools)."

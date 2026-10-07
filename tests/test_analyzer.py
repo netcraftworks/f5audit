@@ -776,13 +776,57 @@ def test_dead_chain_without_attached_logic_stays_offline():
     assert result.pool_verdicts["/Common/pool-dead"].verdict == Verdict.OFFLINE_CANDIDATE
 
 
-def test_dead_pool_reached_only_through_irule_reference_is_not_held_by_attached_logic():
+def test_dead_pool_named_by_irule_is_manual_review():
     def mutate(parsed):
         # pool-irule is named by irule-static on vs-web, never a default pool.
         parsed.pools["/Common/pool-irule"].members = []
 
     result = analyze(mutate=mutate)
-    assert result.pool_verdicts["/Common/pool-irule"].verdict == Verdict.OFFLINE_CANDIDATE
+    verdict = result.pool_verdicts["/Common/pool-irule"]
+    assert verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "Pool has no members" in verdict.notes
+    assert "referenced by iRule(s) /Common/irule-static; tmsh refuses the delete" in verdict.notes
+    assert "policy(ies)" not in verdict.notes
+    assert "/Common/pool-irule" in result.offline_pools
+    assert has_review_item(result, "pool", "/Common/pool-irule", "/Common/irule-static")
+
+
+def test_dead_pool_forwarded_to_by_policy_is_manual_review():
+    def mutate(parsed):
+        parsed.policies["/Common/policy-forward"] = Policy(
+            full_path="/Common/policy-forward",
+            partition="Common",
+            name="policy-forward",
+            forwarded_pools=["/Common/pool-orphan"],
+        )
+
+    result = analyze(mutate=mutate)
+    # pool-orphan has no members in the fixture: referenced now, so dead
+    # rather than ORPHAN, and not removable until the policy is edited.
+    verdict = result.pool_verdicts["/Common/pool-orphan"]
+    assert verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "referenced by policy(ies) /Common/policy-forward" in verdict.notes
+    assert "iRule(s)" not in verdict.notes
+
+
+def test_default_pool_also_named_by_its_virtual_irule_is_held_once_per_cause():
+    def mutate(parsed):
+        parsed.irules["/Common/irule-dead"] = IRule(
+            full_path="/Common/irule-dead",
+            partition="Common",
+            name="irule-dead",
+            definition="pool pool-dead",
+            referenced_pools=["/Common/pool-dead"],
+        )
+        parsed.virtuals["/Common/vs-dead"].irules.append("/Common/irule-dead")
+
+    result = analyze(mutate=mutate)
+    verdict = result.pool_verdicts["/Common/pool-dead"]
+    assert verdict.verdict == Verdict.MANUAL_REVIEW
+    assert "default pool of virtual server(s) /Common/vs-dead" in verdict.notes
+    assert "referenced by iRule(s) /Common/irule-dead" in verdict.notes
+    items = [item for item in result.manual_review if item.full_path == "/Common/pool-dead"]
+    assert len(items) == 2
 
 
 def test_standby_with_flag_outranks_attached_logic_hold():
